@@ -1,5 +1,5 @@
 # Parameter-Conditioned Reachable Sets for Updating Safety Assurances Online
-### [Project Page](http://people.eecs.berkeley.edu/~somil/index.html) | [Paper](https://arxiv.org/abs/2209.14976)<br>
+### [Project Page](https://javierborquez.github.io/ParamCondReachability/) | [Paper](https://arxiv.org/abs/2209.14976)<br>
 
 
 [Javier Borquez](https://javierborquez.github.io/),
@@ -37,6 +37,15 @@ python train_hji_parameterconditioned_simplerocketlanding.py --experiment_name r
 ```
 This will regularly save checkpoints in the directory specified by the rootpath in the script. 
 
+Once training is complete to get detailed value functions at different state and time slices run: 
+```
+python validate_hji_parameterconditioned_simplerocketlanding
+```
+
+Or for trajectory simulation run: 
+```
+python plot_parameterconditioned_simplerocketlanding_trajectory_and_brt
+```
 
 ## Contact
 If you have any questions, please feel free to email the authors.
