@@ -523,852 +523,241 @@ class ReachabilityDrone2DSource(Dataset):
 
         return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask}
 
-
-#experimental models
-class ReachabilityDrone3Dp1DSource(Dataset):
-    def __init__(self, numpoints, velocity=8.0,
-        omega_max=80.0, pretrain=False, tMin=0.0,
-        tMax=1.0, counter_start=0, counter_end=100e3, 
-        pretrain_iters=2000, angle_alpha=1.0, num_src_samples=1000, seed=0):
+class ReachabilityParameterConditionedSimpleRocketLandingSource(Dataset):
+    def __init__(self, numpoints, pretrain=False, tMin=0.0, tMax=1.0, counter_start=0, counter_end=100e3, 
+                 pretrain_iters=10000, num_src_samples=10000, num_target_samples=10000, diffModel=False,
+                lxType='unit_normalized_max'):
         super().__init__()
         torch.manual_seed(0)
 
         self.pretrain = pretrain
+        self.diffModel = diffModel
+        self.lxType = lxType
+
         self.numpoints = numpoints
-        
-        self.velocity = velocity
-        self.omega_max = omega_max       
 
-        self.alpha_angle = angle_alpha * math.pi
+        self.num_states = 7
 
-        self.num_states = 4
-
-        self.tMax = tMax
-        self.tMin = tMin
-
-        self.N_src_samples = num_src_samples
-
-        self.pretrain_counter = 0
-        self.counter = counter_start
-        self.pretrain_iters = pretrain_iters
-        self.full_count = counter_end 
-
-        # Set the seed
-        torch.manual_seed(seed)
-
-    def __len__(self):
-        return 1
-
-    def compute_lx(self, state_coords): #target set hardcoded to circle centered in (15,25) with r=4
-        # Compute the target boundary condition given the normalized state coordinates.
-        goal_tensor = torch.tensor([-.25, .25]).type(torch.FloatTensor)[None]
-        dist = torch.norm(state_coords[:, 0:2] - goal_tensor, dim=1, keepdim=True) - 0.2
-        return dist
-
-    def compute_gx(self, state_coords):
-        # Compute the obstacle boundary condition given the state coordinates. Negative inside the obstacle positive outside.
-        # signed distance except on diag
-        dist_obs1 = torch.max(torch.abs(state_coords[:, 0] - (-.75)) - .25, torch.abs(state_coords[:, 1] - (-.25)) - .25)
-        dist_obs2 = torch.max(torch.abs(state_coords[:, 0] - (-.15)) - .15, torch.abs(state_coords[:, 1] - (-.25)) - .25)
-        dist = torch.min(dist_obs1,dist_obs2)
-        dist = torch.unsqueeze(dist, 1)
-        return dist
-
-    def compute_IC(self, state_coords):
-        lx = self.compute_lx(state_coords)
-        gx_factor = 6.0
-        gx = self.compute_gx(state_coords) * gx_factor
-        hx = -gx       
-        vx = torch.max(lx, hx)
-        return lx, hx, vx    
-
-
-    def __getitem__(self, idx):
-        start_time = 0.  # time to apply  initial conditions
-
-        # uniformly sample domain and include coordinates where source is non-zero 
-        coords = torch.zeros(self.numpoints, self.num_states).uniform_(-1, 1)
-
-        if self.pretrain:
-            # only sample in time around the initial condition
-            time = torch.ones(self.numpoints, 1) * start_time
-            coords = torch.cat((time, coords), dim=1)
-        else:
-            # slowly grow time values from start time
-            # this currently assumes start_time = 0 and max time value is tMax
-            time = self.tMin + torch.zeros(self.numpoints, 1).uniform_(0, (self.tMax-self.tMin) * (self.counter / self.full_count))
-            coords = torch.cat((time, coords), dim=1)
-
-            # make sure we always have training samples at the initial time
-            coords[-self.N_src_samples:, 0] = start_time
-          
-        # set up the initial value function
-        lx, hx, boundary_values = self.compute_IC(coords[:, 1:])
-        # normalize the value function
-        norm_to = 0.02
-        mean = 0.7
-        var = 0.9
-        
-        boundary_values = (boundary_values - mean)*norm_to/var
-        lx = (lx - mean)*norm_to/var
-        hx = (hx - mean)*norm_to/var
-                
-        if self.pretrain:
-            dirichlet_mask = torch.ones(coords.shape[0], 1) > 0
-        else:
-            # only enforce initial conditions around start_time
-            dirichlet_mask = (coords[:, 0, None] == start_time)
-
-        if self.pretrain:
-            self.pretrain_counter += 1
-        elif self.counter < self.full_count:
-            self.counter += 1
-
-        if self.pretrain and self.pretrain_counter == self.pretrain_iters:
-            self.pretrain = False
-
-        return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask,'lx': lx, 'hx': hx}
-
-class ReachabilityDrone3DSource(Dataset):
-    def __init__(self, numpoints, velocity=2.0, dbar=0.8,
-        omega_max=1.0, pretrain=False, tMin=0.0,
-        tMax=1.0, state_setting='big',
-        counter_start=0, counter_end=100e3,
-        pretrain_iters=2000, num_src_samples=1000,
-        seed=0):
-     
-        super().__init__()
-        torch.manual_seed(0)
-
-        self.pretrain = pretrain
-        self.numpoints = numpoints
-        
-        self.velocity = velocity
-        self.omega_max = omega_max
-        self.dbar = dbar
-
-        self.num_states = 3
-      
-        self.tMin = tMin
-        self.tMax = tMax
-
+        # Normalization coeffs        
         self.alpha = {}
         self.beta = {}
 
-        if state_setting == 'big':
-            self.alpha['x'] = 20.0
-            self.alpha['y'] = 20.0
-            self.alpha['th'] = 1.2*math.pi           
-            self.alpha['time'] = 80.0
-
-            self.beta['x'] = 20.0
-            self.beta['y'] = 20.0
-            self.beta['th'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([15.0])
-            self.goalY = np.array([25.0])
-            self.L = 4.0            
-        else:
-            raise NotImplementedError
-
-        self.N_src_samples = num_src_samples
-
-        self.pretrain_counter = 0
-        self.counter = counter_start
-        self.pretrain_iters = pretrain_iters
-        self.full_count = counter_end 
-
-    def __len__(self):
-        return 1
-
-    def __getitem__(self, idx):
-        start_time = 0.  # time to apply  initial conditions
-
-        # uniformly sample domain and include coordinates where source is non-zero 
-        coords = torch.zeros(self.numpoints, self.num_states).uniform_(-1, 1)
-
-        if self.pretrain:
-            # only sample in time around the initial condition
-            time = torch.ones(self.numpoints, 1) * start_time
-            coords = torch.cat((time, coords), dim=1)
-        else:
-            # slowly grow time values from start time
-            # this currently assumes start_time = tMin and max time value is tMax
-            time = self.tMin + torch.zeros(self.numpoints, 1).uniform_(0, (self.tMax-self.tMin) * (self.counter / self.full_count))
-        
-            coords = torch.cat((time, coords), dim=1)
-
-            # make sure we always have training samples at the initial time
-            coords[-self.N_src_samples:, 0] = start_time
-
-        # set up the initial value function
-        state_coords_unnormalized = coords[..., 1:] * 1.0
-        state_coords_unnormalized[:, 0] = state_coords_unnormalized[:, 0] * self.alpha['x'] + self.beta['x']
-        state_coords_unnormalized[:, 1] = state_coords_unnormalized[:, 1] * self.alpha['y'] + self.beta['y']
-        state_coords_unnormalized[:, 2] = state_coords_unnormalized[:, 2] * self.alpha['th'] + self.beta['th']
-
-        goal_tensor = torch.tensor([self.goalX[0], self.goalY[0]]).type(torch.FloatTensor)[None]
-        boundary_values = torch.norm(state_coords_unnormalized[:, 0:2] - goal_tensor, dim=1, keepdim=True) - self.L
-        # goal_tensor = torch.tensor([-.25, .25]).type(torch.FloatTensor)[None]
-        # boundary_values = torch.norm(coords[:, 1:3] - goal_tensor, dim=1, keepdim=True) - 0.2
-        
-        # normalize the value function
-        norm_to = 0.02
-        mean = 0.7 * self.alpha['x']
-        var = 0.9 * self.alpha['x']
-        boundary_values = (boundary_values - mean)*norm_to/var
-        
-        if self.pretrain:
-            dirichlet_mask = torch.ones(coords.shape[0], 1) > 0
-        else:
-            # only enforce initial conditions around start_time
-            dirichlet_mask = (coords[:, 0, None] == start_time)
-
-        if self.pretrain:
-            self.pretrain_counter += 1
-        elif self.counter < self.full_count:
-            self.counter += 1
-
-        if self.pretrain and self.pretrain_counter == self.pretrain_iters:
-            self.pretrain = False
-
-        return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask}
-
-class ReachabilityNarrow8DSource(Dataset):
-    def __init__(self, numpoints, pretrain, tMin, tMax, mu, counter_start, counter_end, pretrain_iters, norm_scheme, clip_value_gradients,
-                 gx_factor, speed_setting, sampling_bias_ratio, env_setting, ham_version, target_setting, collision_setting, 
-                 curriculum_version, HJIVI_smoothing_setting, smoothing_exponent, num_src_samples):
-        super().__init__()
-        torch.manual_seed(0)
-
-        self.pretrain = pretrain
-        self.numpoints = numpoints
-        
-        self.num_vehicles = 2
-        self.num_states = 4 * self.num_vehicles
-
-        self.tMax = tMax
+        #time is between [0 1]
+        self.alpha['time'] = tMax
+        self.tMax = 1
         self.tMin = tMin
-        self.mu = mu
 
         # Define state alphas and betas so that all coordinates are from [-1, 1]. 
         # The conversion rule is state' = (state - beta)/alpha. state' is in [-1, 1].
-        # [state sequence: x_Ri, y_Ri, th_Ri, v_Ri, phi_Ri, ...]. Ri is the ith vehicle.
-        self.alpha = {}
-        self.beta = {}
+        # [state sequence: y, z, th, psi, y_dot, z_dot, th_dot, psi_dot, m]
+        self.alpha['y'] = 150.0 # y in [-150, 150]m
+        self.alpha['z'] = 70.0 # z in [10, 150]m
+        self.alpha['th'] = 1.2 * math.pi
+
+        self.alpha['y_dot'] = 200.0 # in [-200, 200] range
+        self.alpha['z_dot'] = 200.0 # in [-200, 200] range
+        self.alpha['th_dot'] = 10.0 # in [-10, 10] range
+
+        self.alpha['param'] = 20.0 # in [-20, 20]m range
+
+        self.beta['y'] = 0.0
+        self.beta['z'] = 80.0
+        self.beta['th'] = 0.0
+
+        self.beta['y_dot'] = 0.0
+        self.beta['z_dot'] = 0.0
+        self.beta['th_dot'] = 0.0
+
+        self.beta['param'] = 0.0
+
+        # Define system parameters
+        self.dynSys = {}
+        self.dynSys['alpha'] = 0.3
+        self.dynSys['thrustMax'] = 250.0
+
+        # distances
+        self.dynSys['L'] = 10.0  #  Distance from COM of rocket to bottom of rocket  (Rocket length is 2*L)
+        self.dynSys['r'] = 2.0  #  Radius of rocket
+
+        # mass
+        self.dynSys['m_nofuel'] = 25.0 # Mass without fuel
+        self.dynSys['max_m_fuel'] = 6*self.dynSys['m_nofuel']  # Max fuel mass
         
-        if speed_setting == 'medium_v2':
-            self.alpha['x'] = 8.0
-            self.alpha['y'] = 3.8
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 4.0
-            #self.alpha['phi'] = 1.2*0.3*math.pi
-            self.alpha['time'] = 10.0/self.tMax
+        # inertia
+        self.dynSys['J'] = 1/12*(self.dynSys['m_nofuel']+self.dynSys['max_m_fuel'])*(2*self.dynSys['L'])**2  #  Inertia of the rocket in body frame
+        self.dynSys['JT'] = (83/320 + 1)*0.05*self.dynSys['m_nofuel']*self.dynSys['r']**2 #  Inertial of the gimballed thruster
+        
+        # other constants
+        self.dynSys['g'] = 9.81 #  Acceleration due to gravity
+        self.dynSys['gamma'] = 1000.0 # Output velocity of the gas
 
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 3.0
-            self.beta['phi'] = 0.0
+        # Max control parameters
+        self.dynSys['max_tau'] = 10.0 # Max thrust vectoring gimbal torque
+        self.dynSys['max_fT'] = 25.0 # Max fuel burn rate - with gamma=1000, this corresponds to 14g
 
-            # Target positions
-            self.goalX = np.array([6.0, -6.0])
-            self.goalY = np.array([-1.4, 1.4])
+        # Target parameters
+        self.dynSys['max_y'] = 20.0 #  Max y (horizontal position) at landing - landing pad goes from -y to +y
+        self.dynSys['max_z'] = self.dynSys['L']
+        self.dynSys['max_th'] = math.pi/6.0 #  Max theta at landing (radians)
+        self.dynSys['max_speed'] = 5.0 # Max speed at landing
+        self.dynSys['max_dth'] = 1.0 # Max rotational speed at landing
 
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 6.50
-            self.phiMin = -0.3*math.pi + 0.001
-            self.phiMax = 0.3*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -3.0*math.pi
-            self.psiMax = 3.0*math.pi
-        else:
-            raise NotImplementedError
-
-        # How to weigh the obstacles
-        self.gx_factor = gx_factor
-
-        if env_setting == 'v2':
-            # Vehicle diameter/length
-            self.L = 2.0
-
-            # Lower and upper curb positions (in the y direction)
-            self.curb_positions = np.array([-2.8, 2.8])
-
-            # Stranded car position
-            self.stranded_car_pos = np.array([0.0, -1.8])
-        else:
+        # Value function normalization parameters
+        if self.lxType in ['reducedlx_max_normalized', 'reducedlx2_max_normalized']:
+            self.norm_to = 0.02
+            self.mean = 0.0
+            self.var = 1.0
+        else: 
             raise NotImplementedError
 
         self.N_src_samples = num_src_samples
+        self.N_target_coords = num_target_samples
 
         self.pretrain_counter = 0
         self.counter = counter_start
         self.pretrain_iters = pretrain_iters
-        self.full_count = counter_end 
+        self.full_count = counter_end
 
-        self.normalization_scheme = norm_scheme
-        self.sampling_bias_ratio = sampling_bias_ratio
-        self.clip_value_gradients = clip_value_gradients
-
-        self.ham_version = ham_version
-        self.target_setting = target_setting
-        self.collision_setting = collision_setting
-        self.curriculum_version = curriculum_version
-        self.HJIVI_smoothing_setting = HJIVI_smoothing_setting
-        self.smoothing_exponent = smoothing_exponent
-        if self.normalization_scheme == 'hack1':
-            self.norm_to = 0.02
-            self.mean = 0.25 * self.alpha['x']
-            self.var = 0.5 * self.alpha['x']
-        else:
-            raise NotImplementedError
-
-    def compute_lx(self, state_coords_unnormalized):
+    def compute_lx(self, state_coords_normalized):
         # Compute the target boundary condition given the unnormalized state coordinates.
-        if self.target_setting in ['v1']:
-            # Vehicle 1
-            goal_tensor_R1 = torch.tensor([self.goalX[0], self.goalY[0]]).type(torch.FloatTensor)[None]
-            dist_R1 = torch.norm(state_coords_unnormalized[:, 0:2] - goal_tensor_R1, dim=1, keepdim=True) - self.L
-            # Vehicle 2
-            goal_tensor_R2 = torch.tensor([self.goalX[1], self.goalY[1]]).type(torch.FloatTensor)[None]
-            dist_R2 = torch.norm(state_coords_unnormalized[:, 4:6] - goal_tensor_R2, dim=1, keepdim=True) - self.L
-            if self.target_setting == 'v1':
-                return torch.max(dist_R1, dist_R2)
+        state_coords_unnormalized = self.unnormalize_states(state_coords_normalized)
+
+        if self.lxType == 'reducedlx_max_normalized':
+            # Only target set in the yz direction
+            # Target set position in y direction
+            dist_y = torch.abs(state_coords_unnormalized[:, 0:1] - state_coords_unnormalized[:, 6:7]) - self.dynSys['max_y'] #[-20, 150] range
+
+            # Target set position in z direction
+            dist_z = state_coords_unnormalized[:, 1:2] - self.dynSys['L'] - self.dynSys['max_z']  #[-10, 130] range
+
+            # First compute the l(x) as you normally would but then normalize it later.
+            lx = torch.max(dist_y, dist_z)
+            lx = torch.where((lx >= 0), lx/150.0, lx/10.0)
+        elif self.lxType == 'reducedlx2_max_normalized':
+            # Only target set in the yz direction
+            # Target set position in y direction
+            dist_y = torch.abs(state_coords_unnormalized[:, 0:1] - state_coords_unnormalized[:, 6:7]) - self.dynSys['max_y'] #[-20, 150] range
+
+            # Target set position in z direction
+            dist_z = state_coords_unnormalized[:, 1:2] - self.dynSys['L'] - self.dynSys['max_z']  #[-10, 130] range
+
+            # Target set in velocity direction
+            dist_v = torch.norm(state_coords_unnormalized[:, 3:5], dim=1, keepdim=True) - self.dynSys['max_speed'] #[-5, 200] range
+
+            # First compute the l(x) as you normally would but then normalize it later.
+            lx = torch.max(torch.max(dist_y, dist_z), dist_v)
+            lx = torch.where((lx >= 0), lx/280.0, lx/5.0)
         else:
             raise NotImplementedError
 
-    def compute_gx(self, state_coords_unnormalized):
-        # Compute the obstacle boundary condition given the unnormalized state coordinates. Negative inside the obstacle positive outside.
-        # Distance from the lower curb
-        dist_lc_R1 = state_coords_unnormalized[:, 1:2] - self.curb_positions[0] - 0.5*self.L
-        dist_lc_R2 = state_coords_unnormalized[:, 5:6] - self.curb_positions[0] - 0.5*self.L
-        dist_lc = torch.min(dist_lc_R1, dist_lc_R2)
-        # dist_lc = torch.min(state_coords_unnormalized[:, 1:2] - self.curb_positions[0] - 0.5*self.L, state_coords_unnormalized[:, 6:7] - self.curb_positions[0] - 0.5*self.L)
-        
-        # Distance from the upper curb
-        dist_uc_R1 = self.curb_positions[1] - state_coords_unnormalized[:, 1:2] - 0.5*self.L
-        dist_uc_R2 = self.curb_positions[1] - state_coords_unnormalized[:, 5:6] - 0.5*self.L
-        dist_uc = torch.min(dist_uc_R1, dist_uc_R2)
-        # dist_uc = torch.min(self.curb_positions[1] - state_coords_unnormalized[:, 1:2] - 0.5*self.L, self.curb_positions[1] - state_coords_unnormalized[:, 6:7] - 0.5*self.L)
-        
-        # Distance from the stranded car
-        stranded_car_pos = torch.tensor(self.stranded_car_pos*1.0).type(torch.FloatTensor)
-        if self.mu == -10.0:  #no mu scenario
-          dist_stranded_R1 = torch.norm(state_coords_unnormalized[:, 0:2] - stranded_car_pos, dim=1, keepdim=True) - self.L
-          dist_stranded_R2 = torch.norm(state_coords_unnormalized[:, 4:6] - stranded_car_pos, dim=1, keepdim=True) - self.L
-        else:
-          le = 2 + self.mu               #radius*
-          wi = 0.75 + 0.25 * self.mu     #radius*
-          le_inflated = le + 0.5*self.L
-          wi_inflated = wi + 0.5*self.L
-          state_centered_R1 = state_coords_unnormalized[:, 0:2] - stranded_car_pos
-          state_centered_R1[:, 1] = state_centered_R1[:, 1] * (le_inflated/wi_inflated)#y component scaled
-          state_centered_R2 = state_coords_unnormalized[:, 4:6] - stranded_car_pos
-          state_centered_R2[:, 1] = state_centered_R2[:, 1] * (le_inflated/wi_inflated)#y component scaled
-          dist_stranded_R1 = torch.norm(state_centered_R1, dim=1, keepdim=True) - le_inflated
-          dist_stranded_R2 = torch.norm(state_centered_R2, dim=1, keepdim=True) - le_inflated          
-
-        dist_stranded = torch.min(dist_stranded_R1, dist_stranded_R2)
-
-
-        # Distance between the vehicles themselves
-        dist_R1R2 = torch.norm(state_coords_unnormalized[:, 0:2] - state_coords_unnormalized[:, 4:6], dim=1, keepdim=True) - self.L
-
-        if self.collision_setting == 'v1':
-            return torch.min(torch.min(torch.min(dist_lc, dist_uc), dist_stranded), dist_R1R2) * self.gx_factor
-        else:
-            raise NotImplementedError
-
-    def compute_IC(self, state_coords):
-        # Compute the boundary condition given the normalized state coordinates.
-        state_coords_unnormalized = state_coords * 1.0
-        state_coords_unnormalized[:, 0] = state_coords_unnormalized[:, 0] * self.alpha['x'] + self.beta['x']
-        state_coords_unnormalized[:, 1] = state_coords_unnormalized[:, 1] * self.alpha['y'] + self.beta['y']
-        state_coords_unnormalized[:, 2] = state_coords_unnormalized[:, 2] * self.alpha['th'] + self.beta['th']
-        state_coords_unnormalized[:, 3] = state_coords_unnormalized[:, 3] * self.alpha['v'] + self.beta['v']
-        #state_coords_unnormalized[:, 4] = state_coords_unnormalized[:, 4] * self.alpha['phi'] + self.beta['phi']
-
-        state_coords_unnormalized[:, 4] = state_coords_unnormalized[:, 4] * self.alpha['x'] + self.beta['x']
-        state_coords_unnormalized[:, 5] = state_coords_unnormalized[:, 5] * self.alpha['y'] + self.beta['y']
-        state_coords_unnormalized[:, 6] = state_coords_unnormalized[:, 6] * self.alpha['th'] + self.beta['th']
-        state_coords_unnormalized[:, 7] = state_coords_unnormalized[:, 7] * self.alpha['v'] + self.beta['v']
-        #state_coords_unnormalized[:, 9] = state_coords_unnormalized[:, 9] * self.alpha['phi'] + self.beta['phi']
-
-        lx = self.compute_lx(state_coords_unnormalized)
-        gx = self.compute_gx(state_coords_unnormalized)
-        hx = -gx
-        vx = torch.max(lx, hx)
-        # return lx, gx, vx
-        return lx, hx, vx
-
-    def compute_vehicle_ham(self, x, dudx, return_opt_ctrl=False, Rindex=None):
-        # Limit acceleration bounds based on the speed
-        zero_tensor = torch.Tensor([0]).cuda()
-        aMin = torch.ones_like(x[..., 3]) * self.aMin
-        aMin = torch.where((x[..., 3] <= self.vMin), zero_tensor, aMin)
-        aMax = torch.ones_like(x[..., 3]) * self.aMax
-        aMax = torch.where((x[..., 3] >= self.vMax), zero_tensor, aMax)
-
-        # Limit steering bounds based on the speed
-        # psiMin = torch.ones_like(x[..., 4]) * self.psiMin
-        # psiMin = torch.where((x[..., 4] <= self.phiMin), zero_tensor, psiMin)
-        # psiMax = torch.ones_like(x[..., 4]) * self.psiMax
-        # psiMax = torch.where((x[..., 4] >= self.phiMax), zero_tensor, psiMax)
-        phiMin = torch.ones_like(x[..., 2]) * self.phiMin
-        phiMax = torch.ones_like(x[..., 2]) * self.phiMax
-
-        # Compute optimal control
-        opt_acc = torch.where((dudx[..., 3] > 0), aMin, aMax)
-        opt_phi = torch.where((dudx[..., 2] > 0), phiMin, phiMax)
-
-        if (self.curriculum_version in ['v2', 'v3']) and (Rindex == 1):
-            # Velocity can't change
-            opt_acc = 0.0*opt_acc
-
-        # Compute Hamiltonian
-        ham_vehicle = x[..., 3] * torch.cos(x[..., 2]) * dudx[..., 0] + \
-                      x[..., 3] * torch.sin(x[..., 2]) * dudx[..., 1] + \
-                      x[..., 3] * torch.tan(opt_phi) * dudx[..., 2] / self.L + \
-                      opt_acc * dudx[..., 3]
-
-        # Freeze the Hamiltonian if required
-        if self.ham_version == 'v2':
-            # Check if vehicle is within the target point and if so, freeze the Hamiltonian selectively
-            goal_tensor = torch.tensor([self.goalX[Rindex], self.goalY[Rindex]]).type(torch.FloatTensor)[None, None].cuda()
-            dist_to_goal = torch.norm(x[..., 0:2] - goal_tensor, dim=-1) - 0.5*self.L
-            ham_vehicle = torch.where((dist_to_goal <= 0), zero_tensor, ham_vehicle)
-        
-        if return_opt_ctrl:
-            opt_ctrl = torch.cat((opt_acc, opt_phi), dim=1)
-            return ham_vehicle, opt_ctrl
-        else:
-            return ham_vehicle
-
-    def compute_overall_ham(self, x, dudx, return_components=False):
-        alpha = self.alpha
-        beta = self.beta
-
-        # Scale the costates appropriately.
-        dudx[..., 0] = dudx[..., 0] / alpha['x']
-        dudx[..., 1] = dudx[..., 1] / alpha['y']
-        dudx[..., 2] = dudx[..., 2] / alpha['th']
-        dudx[..., 3] = dudx[..., 3] / alpha['v']
-        #dudx[..., 4] = dudx[..., 4] / alpha['phi']
-
-        dudx[..., 4] = dudx[..., 4] / alpha['x']
-        dudx[..., 5] = dudx[..., 5] / alpha['y']
-        dudx[..., 6] = dudx[..., 6] / alpha['th']
-        dudx[..., 7] = dudx[..., 7] / alpha['v']
-        #dudx[..., 9] = dudx[..., 9] / alpha['phi']
-
-        # Scale for output normalization
-        norm_to = 0.02
-        mean = 0.25 * alpha['x']
-        var = 0.5 * alpha['x']
-        dudx = dudx * var/norm_to
-
-        # Scale the states appropriately.
-        x_unnormalized = x * 1.0
-        x_unnormalized[..., 0] = x_unnormalized[..., 0] * alpha['x'] + beta['x']
-        x_unnormalized[..., 1] = x_unnormalized[..., 1] * alpha['y'] + beta['y']
-        x_unnormalized[..., 2] = x_unnormalized[..., 2] * alpha['th'] + beta['th']
-        x_unnormalized[..., 3] = x_unnormalized[..., 3] * alpha['v'] + beta['v']
-        #x_unnormalized[..., 4] = x_unnormalized[..., 4] * alpha['phi'] + beta['phi']
-
-        x_unnormalized[..., 4] = x_unnormalized[..., 4] * alpha['x'] + beta['x']
-        x_unnormalized[..., 5] = x_unnormalized[..., 5] * alpha['y'] + beta['y']
-        x_unnormalized[..., 6] = x_unnormalized[..., 6] * alpha['th'] + beta['th']
-        x_unnormalized[..., 7] = x_unnormalized[..., 7] * alpha['v'] + beta['v']
-        #x_unnormalized[..., 9] = x_unnormalized[..., 9] * alpha['phi'] + beta['phi']
-
-        # Compute the hamiltonian
-        ham_R1 = self.compute_vehicle_ham(x_unnormalized[..., 0:4], dudx[..., 0:4], Rindex=0) 
-
-        if self.curriculum_version == 'v4':
-            ham_R2 = 0.0
-        else:
-            ham_R2 = self.compute_vehicle_ham(x_unnormalized[..., 4:], dudx[..., 4:], Rindex=1)
-
-        ## Total Hamiltonian (take care of normalization again)
-        ham_R1 = ham_R1 / (var/norm_to)
-        ham_R2 = ham_R2 / (var/norm_to)
-        ham_total = ham_R1 + ham_R2
-
-        if return_components:
-            return ham_total, ham_R1, ham_R2
-        else:
-            return ham_total
-
-    def propagate_state(self, x, u, dt):
-        x_next = torch.zeros_like(x)
-
-        x_next[0] = x[3] * torch.cos(x[2])        #x1
-        x_next[1] = x[3] * torch.sin(x[2])        #y1
-        x_next[2] = x[3] * np.tan(u[1]) / self.L  #th1
-        x_next[3] = u[0]                          #v1
-
-        x_next[4] = x[7] * torch.cos(x[6])        #x2
-        x_next[5] = x[7] * torch.sin(x[6])        #y2
-        x_next[6] = x[7] * np.tan(u[3]) / self.L  #th2
-        x_next[7] = u[2]                          #v2
-
-        return x + dt*x_next          
-
-    def __len__(self):
-        return 1
-
-    def __getitem__(self, idx):
-        start_time = 0.  # time to apply  initial conditions
-
-        # uniformly sample domain and include coordinates where source is non-zero 
-        coords = torch.zeros(self.numpoints, self.num_states).uniform_(-1, 1)
-
-        if self.sampling_bias_ratio > 0.0:
-            valid_upper_boundary =  (self.curb_positions[1] - 0.5*self.L - self.beta['y'])/self.alpha['y']
-            num_samples = int(self.numpoints * self.sampling_bias_ratio)
-            coords[-num_samples:, 1] = coords[-num_samples:, 1] * valid_upper_boundary
-            coords[-num_samples:, 5] = coords[-num_samples:, 5] * valid_upper_boundary
-
-        if self.curriculum_version in ['v2', 'v4']:
-            # Set velocity to zero, only sample x and y around the goal state
-            speed_value = -self.beta['v']/self.alpha['v']
-            x_value_upper = (self.goalX[1] + 1.0 - self.beta['x'])/self.alpha['x']
-            x_value_lower = (self.goalX[1] - 1.0 - self.beta['x'])/self.alpha['x']
-            y_value_upper = (self.goalY[1] + 0.2 - self.beta['y'])/self.alpha['y']
-            y_value_lower = (self.goalY[1] - 0.2 - self.beta['y'])/self.alpha['y']
-            # coords[:, 5] = torch.zeros(self.numpoints).uniform_(x_value_lower, x_value_upper)???????????
-            # coords[:, 6] = torch.zeros(self.numpoints).uniform_(y_value_lower, y_value_upper)
-            # coords[:, 8] = torch.ones(self.numpoints) * speed_value
-        elif self.curriculum_version == 'v3':
-            # Set velocity to zero, sample x and y anywhere
-            speed_value = -self.beta['v']/self.alpha['v']
-            coords[:, 7] = torch.ones(self.numpoints) * speed_value
-
-        if self.pretrain:
-            # only sample in time around the initial condition
-            time = torch.ones(self.numpoints, 1) * start_time
-            coords = torch.cat((time, coords), dim=1)
-        else:
-            # slowly grow time values from start time; this currently assumes t \in [tMin, tMax]
-            time = self.tMin + torch.zeros(self.numpoints, 1).uniform_(0, (self.tMax-self.tMin) * (self.counter / self.full_count))
-            coords = torch.cat((time, coords), dim=1)
-
-            # make sure we always have training samples at the initial time
-            coords[-self.N_src_samples:, 0] = start_time
-
-        # Compute the initial value function
-        # lx, gx, boundary_values = self.compute_IC(coords[:, 1:])
-        lx, hx, boundary_values = self.compute_IC(coords[:, 1:])
-
-        # print('Min and max value before normalization are %0.4f and %0.4f' %(min(boundary_values), max(boundary_values)))
-        # print('Min and max l(x) before normalization are %0.4f and %0.4f' %(min(lx), max(lx)))
-        # print('Min and max g(x) before normalization are %0.4f and %0.4f' %(min(gx), max(gx)))
-        # print('Min and max h(x) before normalization are %0.4f and %0.4f' %(min(hx), max(hx)))
-        boundary_values = (boundary_values - self.mean)*self.norm_to/self.var
-        lx = (lx - self.mean)*self.norm_to/self.var
-        # gx = (gx - mean)*norm_to/var
-        hx = (hx - self.mean)*self.norm_to/self.var
-        # print('Min and max value after normalization are %0.4f and %0.4f' %(min(boundary_values), max(boundary_values)))
-        # print('Min and max l(x) after normalization are %0.4f and %0.4f' %(min(lx), max(lx)))
-        # print('Min and max g(x) after normalization are %0.4f and %0.4f' %(min(gx), max(gx)))
-        # print('Min and max h(x) after normalization are %0.4f and %0.4f' %(min(hx), max(hx)))
-
-        if self.pretrain:
-            dirichlet_mask = torch.ones(coords.shape[0], 1) > 0
-        else:
-            # only enforce initial conditions around start_time
-            dirichlet_mask = (coords[:, 0, None] == start_time)
-
-        if self.pretrain:
-            self.pretrain_counter += 1
-        elif self.counter < self.full_count:
-            self.counter += 1
-
-        if self.pretrain and self.pretrain_counter == self.pretrain_iters:
-            self.pretrain = False
-
-        # return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask, 'lx': lx, 'gx': gx}
-        return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask, 'lx': lx, 'hx': hx}
-
-class ReachabilityNarrowAvoidSource(Dataset):
-    def __init__(self, numpoints, pretrain, tMin, tMax, mu, counter_start, counter_end, pretrain_iters, norm_scheme, clip_value_gradients,
-                 speed_setting, sampling_bias_ratio, env_setting, ham_version, target_setting, collision_setting, 
-                 curriculum_version, HJIVI_smoothing_setting, smoothing_exponent, num_src_samples):
-        super().__init__()
-        torch.manual_seed(0)
-
-        self.pretrain = pretrain
-        self.numpoints = numpoints
-        
-        self.num_vehicles = 2
-        self.num_states = 5 * self.num_vehicles
-
-        self.tMax = tMax
-        self.tMin = tMin
-        self.mu = mu
-
-        # Define state alphas and betas so that all coordinates are from [-1, 1]. 
-        # The conversion rule is state' = (state - beta)/alpha. state' is in [-1, 1].
-        # [state sequence: x_Ri, y_Ri, th_Ri, v_Ri, phi_Ri, ...]. Ri is the ith vehicle.
-        self.alpha = {}
-        self.beta = {}
-        if speed_setting == 'medium_v2':
-            self.alpha['x'] = 8.0
-            self.alpha['y'] = 3.8
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 4.0
-            self.alpha['phi'] = 1.2*0.3*math.pi
-            self.alpha['time'] = 10.0/self.tMax
-
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 3.0
-            self.beta['phi'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([6.0, -6.0])
-            self.goalY = np.array([-1.4, 1.4])
-
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 6.50
-            self.phiMin = -0.3*math.pi + 0.001
-            self.phiMax = 0.3*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -3.0*math.pi
-            self.psiMax = 3.0*math.pi
-        else:
-            raise NotImplementedError
-
-        # How to weigh the obstacles
-        #self.gx_factor = gx_factor
-
-        if env_setting == 'v2':
-            # Vehicle diameter/length
-            self.L = 2.0
-
-            # Lower and upper curb positions (in the y direction)
-            self.curb_positions = np.array([-2.8, 2.8])
-
-            # Stranded car position
-            self.stranded_car_pos = np.array([0.0, -1.8])
-        else:
-            raise NotImplementedError
-
-        self.N_src_samples = num_src_samples
-
-        self.pretrain_counter = 0
-        self.counter = counter_start
-        self.pretrain_iters = pretrain_iters
-        self.full_count = counter_end 
-
-        self.normalization_scheme = norm_scheme
-        self.sampling_bias_ratio = sampling_bias_ratio
-        self.clip_value_gradients = clip_value_gradients
-
-        self.ham_version = ham_version
-        self.target_setting = target_setting
-        self.collision_setting = collision_setting
-        self.curriculum_version = curriculum_version
-        self.HJIVI_smoothing_setting = HJIVI_smoothing_setting
-        self.smoothing_exponent = smoothing_exponent
-        if self.normalization_scheme == 'hack1':
-            self.norm_to = 0.02
-            self.mean = 0.25 * self.alpha['x']
-            self.var = 0.5 * self.alpha['x']
-        else:
-            raise NotImplementedError
-
-    def compute_lx(self, state_coords_unnormalized):
-        # Compute the obstacle boundary condition given the unnormalized state coordinates. Negative inside the obstacle positive outside.
-        # Distance from the lower curb
-        dist_lc_R1 = state_coords_unnormalized[:, 1:2] - self.curb_positions[0] - 0.5*self.L
-        dist_lc_R2 = state_coords_unnormalized[:, 6:7] - self.curb_positions[0] - 0.5*self.L
-        dist_lc = torch.min(dist_lc_R1, dist_lc_R2)
-        # dist_lc = torch.min(state_coords_unnormalized[:, 1:2] - self.curb_positions[0] - 0.5*self.L, state_coords_unnormalized[:, 6:7] - self.curb_positions[0] - 0.5*self.L)
-        
-        # Distance from the upper curb
-        dist_uc_R1 = self.curb_positions[1] - state_coords_unnormalized[:, 1:2] - 0.5*self.L
-        dist_uc_R2 = self.curb_positions[1] - state_coords_unnormalized[:, 6:7] - 0.5*self.L
-        dist_uc = torch.min(dist_uc_R1, dist_uc_R2)
-        # dist_uc = torch.min(self.curb_positions[1] - state_coords_unnormalized[:, 1:2] - 0.5*self.L, self.curb_positions[1] - state_coords_unnormalized[:, 6:7] - 0.5*self.L)
-        
-        # Distance from the stranded car
-        stranded_car_pos = torch.tensor(self.stranded_car_pos*1.0).type(torch.FloatTensor)
-
-        #dist_stranded_R1 = torch.norm(state_coords_unnormalized[:, 0:2] - stranded_car_pos, dim=1, keepdim=True) - self.L
-        #dist_stranded_R2 = torch.norm(state_coords_unnormalized[:, 5:7] - stranded_car_pos, dim=1, keepdim=True) - self.L
-                
-        le = 2 + self.mu               #radius*
-        wi = 0.75 + 0.25 * self.mu     #radius*
-        le_inflated = le + 0.5*self.L
-        wi_inflated = wi + 0.5*self.L
-        state_centered_R1 = state_coords_unnormalized[:, 0:2] - stranded_car_pos
-        state_centered_R1[:, 1] = state_centered_R1[:, 1] * (le_inflated/wi_inflated)#y component scaled
-        state_centered_R2 = state_coords_unnormalized[:, 5:7] - stranded_car_pos
-        state_centered_R2[:, 1] = state_centered_R2[:, 1] * (le_inflated/wi_inflated)#y component scaled
-        dist_stranded_R1 = torch.norm(state_centered_R1, dim=1, keepdim=True) - le_inflated
-        dist_stranded_R2 = torch.norm(state_centered_R2, dim=1, keepdim=True) - le_inflated
-
-        dist_stranded = torch.min(dist_stranded_R1, dist_stranded_R2)
-
-        # Distance between the vehicles themselves
-        dist_R1R2 = torch.norm(state_coords_unnormalized[:, 0:2] - state_coords_unnormalized[:, 5:7], dim=1, keepdim=True) - self.L
-
-        if self.collision_setting == 'v1':
-            return torch.min(torch.min(torch.min(dist_lc, dist_uc), dist_stranded), dist_R1R2) 
-        elif self.collision_setting == 'v2':
-            return torch.min(torch.min(dist_lc, dist_uc), dist_stranded_R1) 
-        elif self.collision_setting == 'v3':
-            return torch.min(dist_stranded, dist_R1R2)
-        elif self.collision_setting == 'v4':
-            return torch.min(torch.min(torch.min(dist_lc_R1, dist_uc_R1), dist_stranded_R1), dist_R1R2)
-        else:
-            raise NotImplementedError
-
-    def compute_IC(self, state_coords):
-        # Compute the boundary condition given the normalized state coordinates.
-        state_coords_unnormalized = state_coords * 1.0
-        state_coords_unnormalized[:, 0] = state_coords_unnormalized[:, 0] * self.alpha['x'] + self.beta['x']
-        state_coords_unnormalized[:, 1] = state_coords_unnormalized[:, 1] * self.alpha['y'] + self.beta['y']
-        state_coords_unnormalized[:, 2] = state_coords_unnormalized[:, 2] * self.alpha['th'] + self.beta['th']
-        state_coords_unnormalized[:, 3] = state_coords_unnormalized[:, 3] * self.alpha['v'] + self.beta['v']
-        state_coords_unnormalized[:, 4] = state_coords_unnormalized[:, 4] * self.alpha['phi'] + self.beta['phi']
-
-        state_coords_unnormalized[:, 5] = state_coords_unnormalized[:, 5] * self.alpha['x'] + self.beta['x']
-        state_coords_unnormalized[:, 6] = state_coords_unnormalized[:, 6] * self.alpha['y'] + self.beta['y']
-        state_coords_unnormalized[:, 7] = state_coords_unnormalized[:, 7] * self.alpha['th'] + self.beta['th']
-        state_coords_unnormalized[:, 8] = state_coords_unnormalized[:, 8] * self.alpha['v'] + self.beta['v']
-        state_coords_unnormalized[:, 9] = state_coords_unnormalized[:, 9] * self.alpha['phi'] + self.beta['phi']
-
-        lx = self.compute_lx(state_coords_unnormalized)
         return lx
 
-    def compute_vehicle_ham(self, x, dudx, return_opt_ctrl=False, Rindex=None):
-        # Limit acceleration bounds based on the speed
-        zero_tensor = torch.Tensor([0]).cuda()
-        aMin = torch.ones_like(x[..., 3]) * self.aMin
-        aMin = torch.where((x[..., 3] <= self.vMin), zero_tensor, aMin)
-        aMax = torch.ones_like(x[..., 3]) * self.aMax
-        aMax = torch.where((x[..., 3] >= self.vMax), zero_tensor, aMax)
+    def sample_inside_target_set(self, num_samples):
+        # Sample coordinates that are inside the target set.
+        target_coords = torch.zeros(num_samples, self.num_states).uniform_(-1, 1)
 
-        # Limit steering bounds based on the speed
-        psiMin = torch.ones_like(x[..., 4]) * self.psiMin
-        psiMin = torch.where((x[..., 4] <= self.phiMin), zero_tensor, psiMin)
-        psiMax = torch.ones_like(x[..., 4]) * self.psiMax
-        psiMax = torch.where((x[..., 4] >= self.phiMax), zero_tensor, psiMax)
+        if self.lxType == 'reducedlx_max_normalized':
+            # Landing pad position
+            pad_position = target_coords[:, 6] * self.alpha['param'] + self.beta['param']
 
-        # Compute optimal control
-        opt_acc = torch.where((dudx[..., 3] < 0), aMin, aMax)######
-        opt_psi = torch.where((dudx[..., 4] < 0), psiMin, psiMax)######
+            # y position should be between [pad_psoition-20, pad_psoition + 20]
+            target_coords[:, 0] = 1.5 * self.dynSys['max_y'] * target_coords[:, 0] + pad_position
+            target_coords[:, 0] = (target_coords[:, 0] - self.beta['y'])/ self.alpha['y'] 
 
-        if (self.curriculum_version in ['v2', 'v3']) and (Rindex == 1):
-            # Velocity can't change
-            opt_acc = 0.0*opt_acc
+            # z position should be between [10, 20]
+            target_coords[:, 1] = 0.5 * 1.5 * self.dynSys['max_z'] * target_coords[:, 1] + 0.5*(2*self.dynSys['L'] + 1.5*self.dynSys['max_z'])
+            target_coords[:, 1] = (target_coords[:, 1] - self.beta['z'])/ self.alpha['z']
 
-        # Compute Hamiltonian
-        ham_vehicle = x[..., 3] * torch.cos(x[..., 2]) * dudx[..., 0] + \
-                      x[..., 3] * torch.sin(x[..., 2]) * dudx[..., 1] + \
-                      x[..., 3] * torch.tan(x[..., 4]) * dudx[..., 2] / self.L + \
-                      opt_acc * dudx[..., 3] + \
-                      opt_psi * dudx[..., 4]
+        elif self.lxType == 'reducedlx2_max_normalized':
+            # Landing pad position
+            pad_position = target_coords[:, 6] * self.alpha['param'] + self.beta['param']
 
-        # Freeze the Hamiltonian if required
-        if self.ham_version == 'v2':
-            # Check if vehicle is within the target point and if so, freeze the Hamiltonian selectively
-            goal_tensor = torch.tensor([self.goalX[Rindex], self.goalY[Rindex]]).type(torch.FloatTensor)[None, None].cuda()
-            dist_to_goal = torch.norm(x[..., 0:2] - goal_tensor, dim=-1) - 0.5*self.L
-            ham_vehicle = torch.where((dist_to_goal <= 0), zero_tensor, ham_vehicle)
-        
-        if return_opt_ctrl:
-            opt_ctrl = torch.cat((opt_acc, opt_psi), dim=1)
-            return ham_vehicle, opt_ctrl
+            # y position should be between [pad_psoition-20, pad_psoition + 20]
+            target_coords[:, 0] = 1.5 * self.dynSys['max_y'] * target_coords[:, 0] + pad_position
+            target_coords[:, 0] = (target_coords[:, 0] - self.beta['y'])/ self.alpha['y'] 
+
+            # z position should be between [10, 20]
+            target_coords[:, 1] = 0.5 * 1.5 * self.dynSys['max_z'] * target_coords[:, 1] + 0.5*(2*self.dynSys['L'] + 1.5*self.dynSys['max_z'])
+            target_coords[:, 1] = (target_coords[:, 1] - self.beta['z'])/ self.alpha['z']
+
+            # The maximum translatin speed should be 5.0
+            length = 1.5 * self.dynSys['max_speed'] * torch.sqrt(0.5*target_coords[:, 3] + 0.5)
+            angle = target_coords[:, 4] * math.pi
+            target_coords[:, 3] = length * torch.cos(angle)
+            target_coords[:, 4] = length * torch.sin(angle)
+            target_coords[:, 3] = (target_coords[:, 3] - self.beta['y_dot'])/ self.alpha['y_dot']
+            target_coords[:, 4] = (target_coords[:, 4] - self.beta['z_dot'])/ self.alpha['z_dot']
         else:
-            return ham_vehicle
+            raise NotImplementedError
 
-    def compute_overall_ham(self, x, dudx, return_components=False):
+        return target_coords
+
+
+    def normalize_states(self, unnormalized_states):
+        # Normalize the states given the normalized state coordinates
+        state_coords_normalized = unnormalized_states * 1.0
+        state_coords_normalized[..., 0] = (state_coords_normalized[..., 0] - self.beta['y'])/ self.alpha['y'] 
+        state_coords_normalized[..., 1] = (state_coords_normalized[..., 1] - self.beta['z'])/ self.alpha['z']
+        state_coords_normalized[..., 2] = (state_coords_normalized[..., 2] - self.beta['th'])/ self.alpha['th']
+        state_coords_normalized[..., 3] = (state_coords_normalized[..., 3] - self.beta['y_dot'])/ self.alpha['y_dot']
+        state_coords_normalized[..., 4] = (state_coords_normalized[..., 4] - self.beta['z_dot'])/ self.alpha['z_dot']
+        state_coords_normalized[..., 5] = (state_coords_normalized[..., 5] - self.beta['th_dot'])/ self.alpha['th_dot']
+        state_coords_normalized[..., 6] = (state_coords_normalized[..., 6] - self.beta['param'])/ self.alpha['param']
+        return state_coords_normalized
+
+    def unnormalize_states(self, normalized_states):
+        # Unnormalize the states given the normalized state coordinates
+        state_coords_unnormalized = normalized_states * 1.0
+        state_coords_unnormalized[..., 0] = state_coords_unnormalized[..., 0] * self.alpha['y'] + self.beta['y']
+        state_coords_unnormalized[..., 1] = state_coords_unnormalized[..., 1] * self.alpha['z'] + self.beta['z']
+        state_coords_unnormalized[..., 2] = state_coords_unnormalized[..., 2] * self.alpha['th'] + self.beta['th']
+        state_coords_unnormalized[..., 3] = state_coords_unnormalized[..., 3] * self.alpha['y_dot'] + self.beta['y_dot']
+        state_coords_unnormalized[..., 4] = state_coords_unnormalized[..., 4] * self.alpha['z_dot'] + self.beta['z_dot']
+        state_coords_unnormalized[..., 5] = state_coords_unnormalized[..., 5] * self.alpha['th_dot'] + self.beta['th_dot']
+        state_coords_unnormalized[..., 6] = state_coords_unnormalized[..., 6] * self.alpha['param'] + self.beta['param']
+        return state_coords_unnormalized
+
+    def unnormalize_dVdX(self, normalized_dVdX):
+        # Unnormalize dVdX given the normalized value function spatial gradient.
         alpha = self.alpha
-        beta = self.beta
 
         # Scale the costates appropriately.
-        dudx[..., 0] = dudx[..., 0] / alpha['x']
-        dudx[..., 1] = dudx[..., 1] / alpha['y']
-        dudx[..., 2] = dudx[..., 2] / alpha['th']
-        dudx[..., 3] = dudx[..., 3] / alpha['v']
-        dudx[..., 4] = dudx[..., 4] / alpha['phi']
+        unnormalized_dVdX = normalized_dVdX * 1.0
+        unnormalized_dVdX[..., 0] = unnormalized_dVdX[..., 0] / alpha['y']
+        unnormalized_dVdX[..., 1] = unnormalized_dVdX[..., 1] / alpha['z']
+        unnormalized_dVdX[..., 2] = unnormalized_dVdX[..., 2] / alpha['th']
+        unnormalized_dVdX[..., 3] = unnormalized_dVdX[..., 3] / alpha['y_dot']
+        unnormalized_dVdX[..., 4] = unnormalized_dVdX[..., 4] / alpha['z_dot']
+        unnormalized_dVdX[..., 5] = unnormalized_dVdX[..., 5] / alpha['th_dot']
+        unnormalized_dVdX[..., 6] = unnormalized_dVdX[..., 6] / alpha['param']
+        return unnormalized_dVdX
 
-        dudx[..., 5] = dudx[..., 5] / alpha['x']
-        dudx[..., 6] = dudx[..., 6] / alpha['y']
-        dudx[..., 7] = dudx[..., 7] / alpha['th']
-        dudx[..., 8] = dudx[..., 8] / alpha['v']
-        dudx[..., 9] = dudx[..., 9] / alpha['phi']
-
-        # Scale for output normalization
-        norm_to = 0.02
-        mean = 0.25 * alpha['x']
-        var = 0.5 * alpha['x']
-        dudx = dudx * var/norm_to
+    def compute_overall_ham(self, x, dudx, compute_xdot=False):
+        # Scale the costates appropriately.
+        dudx_unnormalized = self.unnormalize_dVdX(dudx)
 
         # Scale the states appropriately.
-        x_unnormalized = x * 1.0
-        x_unnormalized[..., 0] = x_unnormalized[..., 0] * alpha['x'] + beta['x']
-        x_unnormalized[..., 1] = x_unnormalized[..., 1] * alpha['y'] + beta['y']
-        x_unnormalized[..., 2] = x_unnormalized[..., 2] * alpha['th'] + beta['th']
-        x_unnormalized[..., 3] = x_unnormalized[..., 3] * alpha['v'] + beta['v']
-        x_unnormalized[..., 4] = x_unnormalized[..., 4] * alpha['phi'] + beta['phi']
+        x_unnormalized = self.unnormalize_states(x)
 
-        x_unnormalized[..., 5] = x_unnormalized[..., 5] * alpha['x'] + beta['x']
-        x_unnormalized[..., 6] = x_unnormalized[..., 6] * alpha['y'] + beta['y']
-        x_unnormalized[..., 7] = x_unnormalized[..., 7] * alpha['th'] + beta['th']
-        x_unnormalized[..., 8] = x_unnormalized[..., 8] * alpha['v'] + beta['v']
-        x_unnormalized[..., 9] = x_unnormalized[..., 9] * alpha['phi'] + beta['phi']
+        ## Compute the Hamiltonian
+        # Control Hamiltonian
+        u1_coeff = dudx_unnormalized[..., 3] * torch.cos(x_unnormalized[..., 2]) + dudx_unnormalized[..., 4] * torch.sin(x_unnormalized[..., 2]) + self.dynSys['alpha'] * dudx_unnormalized[..., 5]
+        u2_coeff = -dudx_unnormalized[..., 3] * torch.sin(x_unnormalized[..., 2]) + dudx_unnormalized[..., 4] * torch.cos(x_unnormalized[..., 2])
+        ham_ctrl = -self.dynSys['thrustMax'] * torch.sqrt(u1_coeff * u1_coeff + u2_coeff * u2_coeff)
 
-        # Compute the hamiltonian
-        ham_R1 = self.compute_vehicle_ham(x_unnormalized[..., 0:5], dudx[..., 0:5], Rindex=0) 
+        # Constant Hamiltonian
+        ham_constant = dudx_unnormalized[..., 0] * x_unnormalized[..., 3] + dudx_unnormalized[..., 1] * x_unnormalized[..., 4] + \
+                      dudx_unnormalized[..., 2] * x_unnormalized[..., 5]  - dudx_unnormalized[..., 4] * self.dynSys['g']
 
-        if self.curriculum_version == 'v4':
-            ham_R2 = 0.0
-        else:
-            ham_R2 = self.compute_vehicle_ham(x_unnormalized[..., 5:], dudx[..., 5:], Rindex=1)
+        # Compute the Hamiltonian
+        ham_vehicle = ham_ctrl + ham_constant
 
-        ## Total Hamiltonian (take care of normalization again)
-        ham_R1 = ham_R1 / (var/norm_to)
-        ham_R2 = ham_R2 / (var/norm_to)
-        ham_total = ham_R1 + ham_R2
-
-        if return_components:
-            return ham_total, ham_R1, ham_R2
-        else:
-            return ham_total
-
-    def propagate_state(self, x, u, dt):
-        alpha = self.alpha
-        beta = self.beta
-
-        x_next = torch.zeros_like(x)
-        x_next[0] = x[3] * torch.cos(x[2])
-        x_next[1] = x[3] * torch.sin(x[2])
-        x_next[2] = x[3] * torch.tan(x[4]) / self.L
-        x_next[3] = u[0]
-        x_next[4] = u[1]
-
-        x_next[5] = x[8] * torch.cos(x[7])
-        x_next[6] = x[8] * torch.sin(x[7])
-        x_next[7] = x[8] * torch.tan(x[9]) / self.L
-        x_next[8] = u[2]
-        x_next[9] = u[3]
-
-        return x + dt*x_next          
+        temp_value = torch.abs(ham_vehicle).sum()
+        if torch.isnan(temp_value):
+            import ipdb; ipdb.set_trace()
+            print('Need to debug this')
+      
+        return ham_vehicle        
 
     def __len__(self):
         return 1
@@ -1379,31 +768,12 @@ class ReachabilityNarrowAvoidSource(Dataset):
         # uniformly sample domain and include coordinates where source is non-zero 
         coords = torch.zeros(self.numpoints, self.num_states).uniform_(-1, 1)
 
-        if self.sampling_bias_ratio > 0.0:
-            valid_upper_boundary =  (self.curb_positions[1] - 0.5*self.L - self.beta['y'])/self.alpha['y']
-            num_samples = int(self.numpoints * self.sampling_bias_ratio)
-            coords[-num_samples:, 1] = coords[-num_samples:, 1] * valid_upper_boundary
-            coords[-num_samples:, 6] = coords[-num_samples:, 6] * valid_upper_boundary
-
-        if self.curriculum_version in ['v2', 'v4']:
-            # Set velocity to zero, only sample x and y around the goal state
-            speed_value = -self.beta['v']/self.alpha['v']
-            x_value_upper = (self.goalX[1] + 1.0 - self.beta['x'])/self.alpha['x']
-            x_value_lower = (self.goalX[1] - 1.0 - self.beta['x'])/self.alpha['x']
-            y_value_upper = (self.goalY[1] + 0.2 - self.beta['y'])/self.alpha['y']
-            y_value_lower = (self.goalY[1] - 0.2 - self.beta['y'])/self.alpha['y']
-            coords[:, 5] = torch.zeros(self.numpoints).uniform_(x_value_lower, x_value_upper)
-            coords[:, 6] = torch.zeros(self.numpoints).uniform_(y_value_lower, y_value_upper)
-            coords[:, 8] = torch.ones(self.numpoints) * speed_value
-        elif self.curriculum_version == 'v3':
-            # Set velocity to zero, sample x and y anywhere
-            speed_value = -self.beta['v']/self.alpha['v']
-            coords[:, 8] = torch.ones(self.numpoints) * speed_value
-
         if self.pretrain:
             # only sample in time around the initial condition
             time = torch.ones(self.numpoints, 1) * start_time
             coords = torch.cat((time, coords), dim=1)
+            # Add some samples that are inside the target set
+            coords[-self.N_target_coords:, 1:] = self.sample_inside_target_set(self.N_target_coords)
         else:
             # slowly grow time values from start time; this currently assumes t \in [tMin, tMax]
             time = self.tMin + torch.zeros(self.numpoints, 1).uniform_(0, (self.tMax-self.tMin) * (self.counter / self.full_count))
@@ -1412,1639 +782,27 @@ class ReachabilityNarrowAvoidSource(Dataset):
             # make sure we always have training samples at the initial time
             coords[-self.N_src_samples:, 0] = start_time
 
-        # Compute the initial value function
-        # lx, gx, boundary_values = self.compute_IC(coords[:, 1:])
-        lx = self.compute_IC(coords[:, 1:])
-
-        # print('Min and max value before normalization are %0.4f and %0.4f' %(min(boundary_values), max(boundary_values)))
-        # print('Min and max l(x) before normalization are %0.4f and %0.4f' %(min(lx), max(lx)))
-        # print('Min and max g(x) before normalization are %0.4f and %0.4f' %(min(gx), max(gx)))
-        # print('Min and max h(x) before normalization are %0.4f and %0.4f' %(min(hx), max(hx)))
-        lx = (lx - self.mean)*self.norm_to/self.var
-        ##lx = (lx - self.mean)*self.norm_to/self.var
-        # gx = (gx - mean)*norm_to/var
-        ##hx = (hx - self.mean)*self.norm_to/self.var
-        # print('Min and max value after normalization are %0.4f and %0.4f' %(min(boundary_values), max(boundary_values)))
-        # print('Min and max l(x) after normalization are %0.4f and %0.4f' %(min(lx), max(lx)))
-        # print('Min and max g(x) after normalization are %0.4f and %0.4f' %(min(gx), max(gx)))
-        # print('Min and max h(x) after normalization are %0.4f and %0.4f' %(min(hx), max(hx)))
-
-        if self.pretrain:
-            dirichlet_mask = torch.ones(coords.shape[0], 1) > 0
-        else:
-            # only enforce initial conditions around start_time
-            dirichlet_mask = (coords[:, 0, None] == start_time)
-
-        if self.pretrain:
-            self.pretrain_counter += 1
-        elif self.counter < self.full_count:
-            self.counter += 1
-
-        if self.pretrain and self.pretrain_counter == self.pretrain_iters:
-            self.pretrain = False
-
-        # return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask, 'lx': lx, 'gx': gx}
-        return {'coords': coords}, {'lx': lx, 'dirichlet_mask': dirichlet_mask}
-
-class ReachabilityNarrowRefSource(Dataset):
-    def __init__(self, numpoints, pretrain, tMin, tMax, mu, counter_start, counter_end, pretrain_iters, norm_scheme, clip_value_gradients,
-                 gx_factor, speed_setting, sampling_bias_ratio, env_setting, ham_version, target_setting, collision_setting, 
-                 curriculum_version, HJIVI_smoothing_setting, smoothing_exponent, num_src_samples):
-        super().__init__()
-        torch.manual_seed(0)
-
-        self.pretrain = pretrain
-        self.numpoints = numpoints
-        
-        self.num_vehicles = 2
-        self.num_states = 5 * self.num_vehicles
-
-        self.tMax = tMax
-        self.tMin = tMin
-        self.mu = mu
-
-        # Define state alphas and betas so that all coordinates are from [-1, 1]. 
-        # The conversion rule is state' = (state - beta)/alpha. state' is in [-1, 1].
-        # [state sequence: x_Ri, y_Ri, th_Ri, v_Ri, phi_Ri, ...]. Ri is the ith vehicle.
-        self.alpha = {}
-        self.beta = {}
-
-        if speed_setting == 'high':
-            self.alpha['x'] = 60.0
-            self.alpha['y'] = 3.8
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 7.0
-            self.alpha['phi'] = 1.2*0.1*math.pi
-            self.alpha['time'] = 10.0/self.tMax
-
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 6.0
-            self.beta['phi'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([36.0, -36.0])
-            self.goalY = np.array([-1.4, 1.4])
-
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 11.999
-            self.phiMin = -0.1*math.pi + 0.001
-            self.phiMax = 0.1*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -0.1*math.pi
-            self.psiMax = 0.1*math.pi
-
-        elif speed_setting == 'low':
-            self.alpha['x'] = 8.0
-            self.alpha['y'] = 3.8
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 3.0
-            self.alpha['phi'] = 1.2*0.1*math.pi
-            self.alpha['time'] = 6.0/self.tMax
-
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 2.0
-            self.beta['phi'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([6.0, -6.0])
-            self.goalY = np.array([-1.4, 1.4])
-
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 4.50
-            self.phiMin = -0.1*math.pi + 0.001
-            self.phiMax = 0.1*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -0.1*math.pi
-            self.psiMax = 0.1*math.pi
-
-        elif speed_setting == 'medium':
-            self.alpha['x'] = 8.0
-            self.alpha['y'] = 3.8
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 4.0
-            self.alpha['phi'] = 1.2*0.3*math.pi
-            self.alpha['time'] = 10.0/self.tMax
-
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 3.0
-            self.beta['phi'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([6.0, -6.0])
-            self.goalY = np.array([-1.4, 1.4])
-
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 6.50
-            self.phiMin = -0.3*math.pi + 0.001
-            self.phiMax = 0.3*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -0.3*math.pi
-            self.psiMax = 0.3*math.pi
-
-        elif speed_setting == 'medium_v2':
-            self.alpha['x'] = 8.0
-            self.alpha['y'] = 3.8
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 4.0
-            self.alpha['phi'] = 1.2*0.3*math.pi
-            self.alpha['time'] = 10.0/self.tMax
-
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 3.0
-            self.beta['phi'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([6.0, -6.0])
-            self.goalY = np.array([-1.4, 1.4])
-
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 6.50
-            self.phiMin = -0.3*math.pi + 0.001
-            self.phiMax = 0.3*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -3.0*math.pi
-            self.psiMax = 3.0*math.pi
-
-        elif speed_setting == 'medium_v3':
-            self.alpha['x'] = 8.0
-            self.alpha['y'] = 4.0
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 4.0
-            self.alpha['phi'] = 1.2*0.3*math.pi
-            self.alpha['time'] = 10.0/self.tMax
-
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 3.0
-            self.beta['phi'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([6.0, -6.0])
-            self.goalY = np.array([-2.0, 2.0])
-
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 6.50
-            self.phiMin = -0.3*math.pi + 0.001
-            self.phiMax = 0.3*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -3.0*math.pi
-            self.psiMax = 3.0*math.pi
-
-        else:
-            raise NotImplementedError
-
-        # How to weigh the obstacles
-        self.gx_factor = gx_factor
-
-        if env_setting == 'v1':
-            # Vehicle diameter/length
-            self.L = 2.0
-
-            # Lower and upper curb positions (in the y direction)
-            self.curb_positions = np.array([-2.8, 2.8])
-
-            # Stranded car position
-            self.stranded_car_pos = np.array([0.0, -1.4])
-
-        elif env_setting == 'v2':
-            # Vehicle diameter/length
-            self.L = 2.0
-
-            # Lower and upper curb positions (in the y direction)
-            self.curb_positions = np.array([-2.8, 2.8])
-
-            # Stranded car position
-            self.stranded_car_pos = np.array([0.0, -1.8])
-
-        elif env_setting == 'v3':
-            # Vehicle diameter/length
-            self.L = 2.0
-
-            # Lower and upper curb positions (in the y direction)
-            self.curb_positions = np.array([-4.0, 4.0])
-
-            # Stranded car position
-            self.stranded_car_pos = np.array([0.0, -2.0])
-
-        else:
-            raise NotImplementedError
-
-        self.N_src_samples = num_src_samples
-
-        self.pretrain_counter = 0
-        self.counter = counter_start
-        self.pretrain_iters = pretrain_iters
-        self.full_count = counter_end 
-
-        self.normalization_scheme = norm_scheme
-        self.sampling_bias_ratio = sampling_bias_ratio
-        self.clip_value_gradients = clip_value_gradients
-
-        self.ham_version = ham_version
-        self.target_setting = target_setting
-        self.collision_setting = collision_setting
-        self.curriculum_version = curriculum_version
-        self.HJIVI_smoothing_setting = HJIVI_smoothing_setting
-        self.smoothing_exponent = smoothing_exponent
-        if self.normalization_scheme == 'hack1':
-            self.norm_to = 0.02
-            self.mean = 0.25 * self.alpha['x']
-            self.var = 0.5 * self.alpha['x']
-        else:
-            raise NotImplementedError
-
-    def compute_lx(self, state_coords_unnormalized):
-        # Compute the target boundary condition given the unnormalized state coordinates.
-        if self.target_setting in ['v1', 'v2', 'v4']:
-            # Vehicle 1
-            goal_tensor_R1 = torch.tensor([self.goalX[0], self.goalY[0]]).type(torch.FloatTensor)[None]
-            dist_R1 = torch.norm(state_coords_unnormalized[:, 0:2] - goal_tensor_R1, dim=1, keepdim=True) - self.L
-            # Vehicle 2
-            goal_tensor_R2 = torch.tensor([self.goalX[1], self.goalY[1]]).type(torch.FloatTensor)[None]
-            dist_R2 = torch.norm(state_coords_unnormalized[:, 5:7] - goal_tensor_R2, dim=1, keepdim=True) - self.L
-            if self.target_setting == 'v1':
-                return torch.max(dist_R1, dist_R2)
-            elif self.target_setting == 'v2':
-                return dist_R1
-            elif self.target_setting == 'v4':
-                sum_tensor = 0.5*(dist_R1 + dist_R2)
-                max_tensor = 0.5*torch.max(dist_R1, dist_R2)
-                sign_tensor = torch.sign(dist_R1 * dist_R2)
-                return torch.where(sign_tensor < 0, max_tensor, sum_tensor)
-        
-        elif self.target_setting in ['v3']:
-            # Have an infinitely extended target set above and below the center lane
-            dist_R1 = torch.max((self.goalX[0] - 0.5*self.L) - state_coords_unnormalized[..., 0:1], state_coords_unnormalized[..., 1:2])
-            dist_R2 = torch.max(state_coords_unnormalized[..., 5:6] - (self.goalX[1] + 0.5*self.L), -state_coords_unnormalized[..., 6:7])
-            return torch.max(dist_R1, dist_R2)
-
-        else:
-            raise NotImplementedError
-
-    def compute_gx(self, state_coords_unnormalized):
-        # Compute the obstacle boundary condition given the unnormalized state coordinates. Negative inside the obstacle positive outside.
-        # Distance from the lower curb
-        dist_lc_R1 = state_coords_unnormalized[:, 1:2] - self.curb_positions[0] - 0.5*self.L
-        dist_lc_R2 = state_coords_unnormalized[:, 6:7] - self.curb_positions[0] - 0.5*self.L
-        dist_lc = torch.min(dist_lc_R1, dist_lc_R2)
-        # dist_lc = torch.min(state_coords_unnormalized[:, 1:2] - self.curb_positions[0] - 0.5*self.L, state_coords_unnormalized[:, 6:7] - self.curb_positions[0] - 0.5*self.L)
-        
-        # Distance from the upper curb
-        dist_uc_R1 = self.curb_positions[1] - state_coords_unnormalized[:, 1:2] - 0.5*self.L
-        dist_uc_R2 = self.curb_positions[1] - state_coords_unnormalized[:, 6:7] - 0.5*self.L
-        dist_uc = torch.min(dist_uc_R1, dist_uc_R2)
-        # dist_uc = torch.min(self.curb_positions[1] - state_coords_unnormalized[:, 1:2] - 0.5*self.L, self.curb_positions[1] - state_coords_unnormalized[:, 6:7] - 0.5*self.L)
-        
-        # Distance from the stranded car
-        stranded_car_pos = torch.tensor(self.stranded_car_pos*1.0).type(torch.FloatTensor)
-
-        #dist_stranded_R1 = torch.norm(state_coords_unnormalized[:, 0:2] - stranded_car_pos, dim=1, keepdim=True) - self.L
-        #dist_stranded_R2 = torch.norm(state_coords_unnormalized[:, 5:7] - stranded_car_pos, dim=1, keepdim=True) - self.L
-                
-        le = 2 + self.mu               #radius*
-        wi = 0.75 + 0.25 * self.mu     #radius*
-        le_inflated = le + 0.5*self.L
-        wi_inflated = wi + 0.5*self.L
-        state_centered_R1 = state_coords_unnormalized[:, 0:2] - stranded_car_pos
-        state_centered_R1[:, 1] = state_centered_R1[:, 1] * (le_inflated/wi_inflated)#y component scaled
-        state_centered_R2 = state_coords_unnormalized[:, 5:7] - stranded_car_pos
-        state_centered_R2[:, 1] = state_centered_R2[:, 1] * (le_inflated/wi_inflated)#y component scaled
-        dist_stranded_R1 = torch.norm(state_centered_R1, dim=1, keepdim=True) - le_inflated
-        dist_stranded_R2 = torch.norm(state_centered_R2, dim=1, keepdim=True) - le_inflated
-
-        dist_stranded = torch.min(dist_stranded_R1, dist_stranded_R2)
-
-
-        # Distance between the vehicles themselves
-        dist_R1R2 = torch.norm(state_coords_unnormalized[:, 0:2] - state_coords_unnormalized[:, 5:7], dim=1, keepdim=True) - self.L
-
-        if self.collision_setting == 'v1':
-            return torch.min(torch.min(torch.min(dist_lc, dist_uc), dist_stranded), dist_R1R2) * self.gx_factor
-        elif self.collision_setting == 'v2':
-            return torch.min(torch.min(dist_lc, dist_uc), dist_stranded_R1) * self.gx_factor
-        elif self.collision_setting == 'v3':
-            return torch.min(dist_stranded, dist_R1R2) * self.gx_factor
-        elif self.collision_setting == 'v4':
-            return torch.min(torch.min(torch.min(dist_lc_R1, dist_uc_R1), dist_stranded_R1), dist_R1R2) * self.gx_factor
-        else:
-            raise NotImplementedError
-
-    def compute_IC(self, state_coords):
-        # Compute the boundary condition given the normalized state coordinates.
-        state_coords_unnormalized = state_coords * 1.0
-        state_coords_unnormalized[:, 0] = state_coords_unnormalized[:, 0] * self.alpha['x'] + self.beta['x']
-        state_coords_unnormalized[:, 1] = state_coords_unnormalized[:, 1] * self.alpha['y'] + self.beta['y']
-        state_coords_unnormalized[:, 2] = state_coords_unnormalized[:, 2] * self.alpha['th'] + self.beta['th']
-        state_coords_unnormalized[:, 3] = state_coords_unnormalized[:, 3] * self.alpha['v'] + self.beta['v']
-        state_coords_unnormalized[:, 4] = state_coords_unnormalized[:, 4] * self.alpha['phi'] + self.beta['phi']
-
-        state_coords_unnormalized[:, 5] = state_coords_unnormalized[:, 5] * self.alpha['x'] + self.beta['x']
-        state_coords_unnormalized[:, 6] = state_coords_unnormalized[:, 6] * self.alpha['y'] + self.beta['y']
-        state_coords_unnormalized[:, 7] = state_coords_unnormalized[:, 7] * self.alpha['th'] + self.beta['th']
-        state_coords_unnormalized[:, 8] = state_coords_unnormalized[:, 8] * self.alpha['v'] + self.beta['v']
-        state_coords_unnormalized[:, 9] = state_coords_unnormalized[:, 9] * self.alpha['phi'] + self.beta['phi']
-
-        lx = self.compute_lx(state_coords_unnormalized)
-        gx = self.compute_gx(state_coords_unnormalized)
-        hx = -gx
-        vx = torch.max(lx, hx)
-        # return lx, gx, vx
-        return lx, hx, vx
-
-    def compute_vehicle_ham(self, x, dudx, return_opt_ctrl=False, Rindex=None):
-        # Limit acceleration bounds based on the speed
-        zero_tensor = torch.Tensor([0]).cuda()
-        aMin = torch.ones_like(x[..., 3]) * self.aMin
-        aMin = torch.where((x[..., 3] <= self.vMin), zero_tensor, aMin)
-        aMax = torch.ones_like(x[..., 3]) * self.aMax
-        aMax = torch.where((x[..., 3] >= self.vMax), zero_tensor, aMax)
-
-        # Limit steering bounds based on the speed
-        psiMin = torch.ones_like(x[..., 4]) * self.psiMin
-        psiMin = torch.where((x[..., 4] <= self.phiMin), zero_tensor, psiMin)
-        psiMax = torch.ones_like(x[..., 4]) * self.psiMax
-        psiMax = torch.where((x[..., 4] >= self.phiMax), zero_tensor, psiMax)
-
-        # Compute optimal control
-        opt_acc = torch.where((dudx[..., 3] > 0), aMin, aMax)
-        opt_psi = torch.where((dudx[..., 4] > 0), psiMin, psiMax)
-
-        if (self.curriculum_version in ['v2', 'v3']) and (Rindex == 1):
-            # Velocity can't change
-            opt_acc = 0.0*opt_acc
-
-        # Compute Hamiltonian
-        ham_vehicle = x[..., 3] * torch.cos(x[..., 2]) * dudx[..., 0] + \
-                      x[..., 3] * torch.sin(x[..., 2]) * dudx[..., 1] + \
-                      x[..., 3] * torch.tan(x[..., 4]) * dudx[..., 2] / self.L + \
-                      opt_acc * dudx[..., 3] + \
-                      opt_psi * dudx[..., 4]
-
-        # Freeze the Hamiltonian if required
-        if self.ham_version == 'v2':
-            # Check if vehicle is within the target point and if so, freeze the Hamiltonian selectively
-            goal_tensor = torch.tensor([self.goalX[Rindex], self.goalY[Rindex]]).type(torch.FloatTensor)[None, None].cuda()
-            dist_to_goal = torch.norm(x[..., 0:2] - goal_tensor, dim=-1) - 0.5*self.L
-            ham_vehicle = torch.where((dist_to_goal <= 0), zero_tensor, ham_vehicle)
-        
-        if return_opt_ctrl:
-            opt_ctrl = torch.cat((opt_acc, opt_psi), dim=1)
-            return ham_vehicle, opt_ctrl
-        else:
-            return ham_vehicle
-
-    def compute_overall_ham(self, x, dudx, return_components=False):
-        alpha = self.alpha
-        beta = self.beta
-
-        # Scale the costates appropriately.
-        dudx[..., 0] = dudx[..., 0] / alpha['x']
-        dudx[..., 1] = dudx[..., 1] / alpha['y']
-        dudx[..., 2] = dudx[..., 2] / alpha['th']
-        dudx[..., 3] = dudx[..., 3] / alpha['v']
-        dudx[..., 4] = dudx[..., 4] / alpha['phi']
-
-        dudx[..., 5] = dudx[..., 5] / alpha['x']
-        dudx[..., 6] = dudx[..., 6] / alpha['y']
-        dudx[..., 7] = dudx[..., 7] / alpha['th']
-        dudx[..., 8] = dudx[..., 8] / alpha['v']
-        dudx[..., 9] = dudx[..., 9] / alpha['phi']
-
-        # Scale for output normalization
-        norm_to = 0.02
-        mean = 0.25 * alpha['x']
-        var = 0.5 * alpha['x']
-        dudx = dudx * var/norm_to
-
-        # Scale the states appropriately.
-        x_unnormalized = x * 1.0
-        x_unnormalized[..., 0] = x_unnormalized[..., 0] * alpha['x'] + beta['x']
-        x_unnormalized[..., 1] = x_unnormalized[..., 1] * alpha['y'] + beta['y']
-        x_unnormalized[..., 2] = x_unnormalized[..., 2] * alpha['th'] + beta['th']
-        x_unnormalized[..., 3] = x_unnormalized[..., 3] * alpha['v'] + beta['v']
-        x_unnormalized[..., 4] = x_unnormalized[..., 4] * alpha['phi'] + beta['phi']
-
-        x_unnormalized[..., 5] = x_unnormalized[..., 5] * alpha['x'] + beta['x']
-        x_unnormalized[..., 6] = x_unnormalized[..., 6] * alpha['y'] + beta['y']
-        x_unnormalized[..., 7] = x_unnormalized[..., 7] * alpha['th'] + beta['th']
-        x_unnormalized[..., 8] = x_unnormalized[..., 8] * alpha['v'] + beta['v']
-        x_unnormalized[..., 9] = x_unnormalized[..., 9] * alpha['phi'] + beta['phi']
-
-        # Compute the hamiltonian
-        ham_R1 = self.compute_vehicle_ham(x_unnormalized[..., 0:5], dudx[..., 0:5], Rindex=0) 
-
-        if self.curriculum_version == 'v4':
-            ham_R2 = 0.0
-        else:
-            ham_R2 = self.compute_vehicle_ham(x_unnormalized[..., 5:], dudx[..., 5:], Rindex=1)
-
-        ## Total Hamiltonian (take care of normalization again)
-        ham_R1 = ham_R1 / (var/norm_to)
-        ham_R2 = ham_R2 / (var/norm_to)
-        ham_total = ham_R1 + ham_R2
-
-        if return_components:
-            return ham_total, ham_R1, ham_R2
-        else:
-            return ham_total
-
-    def propagate_state(self, x, u, dt):
-        alpha = self.alpha
-        beta = self.beta
-
-        x_next = torch.zeros_like(x)
-        x_next[0] = x[3] * torch.cos(x[2])
-        x_next[1] = x[3] * torch.sin(x[2])
-        x_next[2] = x[3] * torch.tan(x[4]) / self.L
-        x_next[3] = u[0]
-        x_next[4] = u[1]
-
-        x_next[5] = x[8] * torch.cos(x[7])
-        x_next[6] = x[8] * torch.sin(x[7])
-        x_next[7] = x[8] * torch.tan(x[9]) / self.L
-        x_next[8] = u[2]
-        x_next[9] = u[3]
-
-        return x + dt*x_next          
-
-    def __len__(self):
-        return 1
-
-    def __getitem__(self, idx):
-        start_time = 0.  # time to apply  initial conditions
-
-        # uniformly sample domain and include coordinates where source is non-zero 
-        coords = torch.zeros(self.numpoints, self.num_states).uniform_(-1, 1)
-
-        if self.sampling_bias_ratio > 0.0:
-            valid_upper_boundary =  (self.curb_positions[1] - 0.5*self.L - self.beta['y'])/self.alpha['y']
-            num_samples = int(self.numpoints * self.sampling_bias_ratio)
-            coords[-num_samples:, 1] = coords[-num_samples:, 1] * valid_upper_boundary
-            coords[-num_samples:, 6] = coords[-num_samples:, 6] * valid_upper_boundary
-
-        if self.curriculum_version in ['v2', 'v4']:
-            # Set velocity to zero, only sample x and y around the goal state
-            speed_value = -self.beta['v']/self.alpha['v']
-            x_value_upper = (self.goalX[1] + 1.0 - self.beta['x'])/self.alpha['x']
-            x_value_lower = (self.goalX[1] - 1.0 - self.beta['x'])/self.alpha['x']
-            y_value_upper = (self.goalY[1] + 0.2 - self.beta['y'])/self.alpha['y']
-            y_value_lower = (self.goalY[1] - 0.2 - self.beta['y'])/self.alpha['y']
-            coords[:, 5] = torch.zeros(self.numpoints).uniform_(x_value_lower, x_value_upper)
-            coords[:, 6] = torch.zeros(self.numpoints).uniform_(y_value_lower, y_value_upper)
-            coords[:, 8] = torch.ones(self.numpoints) * speed_value
-        elif self.curriculum_version == 'v3':
-            # Set velocity to zero, sample x and y anywhere
-            speed_value = -self.beta['v']/self.alpha['v']
-            coords[:, 8] = torch.ones(self.numpoints) * speed_value
-
-        if self.pretrain:
-            # only sample in time around the initial condition
-            time = torch.ones(self.numpoints, 1) * start_time
-            coords = torch.cat((time, coords), dim=1)
-        else:
-            # slowly grow time values from start time; this currently assumes t \in [tMin, tMax]
-            time = self.tMin + torch.zeros(self.numpoints, 1).uniform_(0, (self.tMax-self.tMin) * (self.counter / self.full_count))
-            coords = torch.cat((time, coords), dim=1)
-
-            # make sure we always have training samples at the initial time
-            coords[-self.N_src_samples:, 0] = start_time
+            # Add some samples that are inside the target set
+            coords[-self.N_target_coords:, 1:] = self.sample_inside_target_set(self.N_target_coords)
 
         # Compute the initial value function
-        # lx, gx, boundary_values = self.compute_IC(coords[:, 1:])
-        lx, hx, boundary_values = self.compute_IC(coords[:, 1:])
-
-        # print('Min and max value before normalization are %0.4f and %0.4f' %(min(boundary_values), max(boundary_values)))
-        # print('Min and max l(x) before normalization are %0.4f and %0.4f' %(min(lx), max(lx)))
-        # print('Min and max g(x) before normalization are %0.4f and %0.4f' %(min(gx), max(gx)))
-        # print('Min and max h(x) before normalization are %0.4f and %0.4f' %(min(hx), max(hx)))
-        boundary_values = (boundary_values - self.mean)*self.norm_to/self.var
-        lx = (lx - self.mean)*self.norm_to/self.var
-        # gx = (gx - mean)*norm_to/var
-        hx = (hx - self.mean)*self.norm_to/self.var
-        # print('Min and max value after normalization are %0.4f and %0.4f' %(min(boundary_values), max(boundary_values)))
-        # print('Min and max l(x) after normalization are %0.4f and %0.4f' %(min(lx), max(lx)))
-        # print('Min and max g(x) after normalization are %0.4f and %0.4f' %(min(gx), max(gx)))
-        # print('Min and max h(x) after normalization are %0.4f and %0.4f' %(min(hx), max(hx)))
-
-        if self.pretrain:
-            dirichlet_mask = torch.ones(coords.shape[0], 1) > 0
-        else:
-            # only enforce initial conditions around start_time
-            dirichlet_mask = (coords[:, 0, None] == start_time)
-
-        if self.pretrain:
-            self.pretrain_counter += 1
-        elif self.counter < self.full_count:
-            self.counter += 1
-
-        if self.pretrain and self.pretrain_counter == self.pretrain_iters:
-            self.pretrain = False
-
-        # return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask, 'lx': lx, 'gx': gx}
-        return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask, 'lx': lx, 'hx': hx}
-
-class ReachabilityNarrowMuSource(Dataset):
-    def __init__(self, numpoints, pretrain, tMin, tMax, counter_start, counter_end, pretrain_iters, norm_scheme, clip_value_gradients,
-                 gx_factor, speed_setting, sampling_bias_ratio, env_setting, ham_version, target_setting, collision_setting, 
-                 curriculum_version, HJIVI_smoothing_setting, smoothing_exponent, num_src_samples):
-        super().__init__()
-        torch.manual_seed(0)
-
-        self.pretrain = pretrain
-        self.numpoints = numpoints
-        
-        self.num_vehicles = 2
-        self.num_states = 5 * self.num_vehicles + 1
-
-        self.tMax = tMax
-        self.tMin = tMin
-        #self.mu = mu
-
-        # Define state alphas and betas so that all coordinates are from [-1, 1]. 
-        # The conversion rule is state' = (state - beta)/alpha. state' is in [-1, 1].
-        # [state sequence: x_Ri, y_Ri, th_Ri, v_Ri, phi_Ri, ...]. Ri is the ith vehicle.
-        self.alpha = {}
-        self.beta = {}
-
-        if speed_setting == 'high':
-            self.alpha['x'] = 60.0
-            self.alpha['y'] = 3.8
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 7.0
-            self.alpha['phi'] = 1.2*0.1*math.pi
-            self.alpha['time'] = 10.0/self.tMax
-
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 6.0
-            self.beta['phi'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([36.0, -36.0])
-            self.goalY = np.array([-1.4, 1.4])
-
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 11.999
-            self.phiMin = -0.1*math.pi + 0.001
-            self.phiMax = 0.1*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -0.1*math.pi
-            self.psiMax = 0.1*math.pi
-
-        elif speed_setting == 'low':
-            self.alpha['x'] = 8.0
-            self.alpha['y'] = 3.8
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 3.0
-            self.alpha['phi'] = 1.2*0.1*math.pi
-            self.alpha['time'] = 6.0/self.tMax
-
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 2.0
-            self.beta['phi'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([6.0, -6.0])
-            self.goalY = np.array([-1.4, 1.4])
-
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 4.50
-            self.phiMin = -0.1*math.pi + 0.001
-            self.phiMax = 0.1*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -0.1*math.pi
-            self.psiMax = 0.1*math.pi
-
-        elif speed_setting == 'medium':
-            self.alpha['x'] = 8.0
-            self.alpha['y'] = 3.8
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 4.0
-            self.alpha['phi'] = 1.2*0.3*math.pi
-            self.alpha['time'] = 10.0/self.tMax   #####
-
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 3.0
-            self.beta['phi'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([6.0, -6.0])
-            self.goalY = np.array([-1.4, 1.4])
-
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 6.50
-            self.phiMin = -0.3*math.pi + 0.001
-            self.phiMax = 0.3*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -0.3*math.pi
-            self.psiMax = 0.3*math.pi
-
-        elif speed_setting == 'medium_v2':
-            self.alpha['x'] = 8.0
-            self.alpha['y'] = 3.8
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 4.0
-            self.alpha['phi'] = 1.2*0.3*math.pi
-            self.alpha['time'] = 10.0/self.tMax
-
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 3.0
-            self.beta['phi'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([6.0, -6.0])
-            self.goalY = np.array([-1.4, 1.4])
-
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 6.50
-            self.phiMin = -0.3*math.pi + 0.001
-            self.phiMax = 0.3*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -3.0*math.pi
-            self.psiMax = 3.0*math.pi
-
-        elif speed_setting == 'medium_v3':
-            self.alpha['x'] = 8.0
-            self.alpha['y'] = 4.0
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 4.0
-            self.alpha['phi'] = 1.2*0.3*math.pi
-            self.alpha['time'] = 10.0/self.tMax
-
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 3.0
-            self.beta['phi'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([6.0, -6.0])
-            self.goalY = np.array([-2.0, 2.0])
-
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 6.50
-            self.phiMin = -0.3*math.pi + 0.001
-            self.phiMax = 0.3*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -3.0*math.pi
-            self.psiMax = 3.0*math.pi
-
-        else:
-            raise NotImplementedError
-
-        # How to weigh the obstacles
-        self.gx_factor = gx_factor
-
-        if env_setting == 'v1':
-            # Vehicle diameter/length
-            self.L = 2.0
-
-            # Lower and upper curb positions (in the y direction)
-            self.curb_positions = np.array([-2.8, 2.8])
-
-            # Stranded car position
-            self.stranded_car_pos = np.array([0.0, -1.4])
-
-        elif env_setting == 'v2':
-            # Vehicle diameter/length
-            self.L = 2.0
-
-            # Lower and upper curb positions (in the y direction)
-            self.curb_positions = np.array([-2.8, 2.8])
-
-            # Stranded car position
-            self.stranded_car_pos = np.array([0.0, -1.8])
-
-        elif env_setting == 'v3':
-            # Vehicle diameter/length
-            self.L = 2.0
-
-            # Lower and upper curb positions (in the y direction)
-            self.curb_positions = np.array([-4.0, 4.0])
-
-            # Stranded car position
-            self.stranded_car_pos = np.array([0.0, -2.0])
-
-        else:
-            raise NotImplementedError
-
-        self.N_src_samples = num_src_samples
-
-        self.pretrain_counter = 0
-        self.counter = counter_start
-        self.pretrain_iters = pretrain_iters
-        self.full_count = counter_end 
-
-        self.normalization_scheme = norm_scheme
-        self.sampling_bias_ratio = sampling_bias_ratio
-        self.clip_value_gradients = clip_value_gradients
-
-        self.ham_version = ham_version
-        self.target_setting = target_setting
-        self.collision_setting = collision_setting
-        self.curriculum_version = curriculum_version
-        self.HJIVI_smoothing_setting = HJIVI_smoothing_setting
-        self.smoothing_exponent = smoothing_exponent
-        if self.normalization_scheme == 'hack1':
-            self.norm_to = 0.02
-            self.mean = 0.25 * self.alpha['x']
-            self.var = 0.5 * self.alpha['x']
-        else:
-            raise NotImplementedError
-
-    def compute_lx(self, state_coords_unnormalized):
-        # Compute the target boundary condition given the unnormalized state coordinates.
-        if self.target_setting in ['v1', 'v2', 'v4']:
-            # Vehicle 1
-            goal_tensor_R1 = torch.tensor([self.goalX[0], self.goalY[0]]).type(torch.FloatTensor)[None]
-            dist_R1 = torch.norm(state_coords_unnormalized[:, 0:2] - goal_tensor_R1, dim=1, keepdim=True) - self.L
-            # Vehicle 2
-            goal_tensor_R2 = torch.tensor([self.goalX[1], self.goalY[1]]).type(torch.FloatTensor)[None]
-            dist_R2 = torch.norm(state_coords_unnormalized[:, 5:7] - goal_tensor_R2, dim=1, keepdim=True) - self.L
-            if self.target_setting == 'v1':
-                return torch.max(dist_R1, dist_R2)
-            elif self.target_setting == 'v2':
-                return dist_R1
-            elif self.target_setting == 'v4':
-                sum_tensor = 0.5*(dist_R1 + dist_R2)
-                max_tensor = 0.5*torch.max(dist_R1, dist_R2)
-                sign_tensor = torch.sign(dist_R1 * dist_R2)
-                return torch.where(sign_tensor < 0, max_tensor, sum_tensor)
-        
-        elif self.target_setting in ['v3']:
-            # Have an infinitely extended target set above and below the center lane
-            dist_R1 = torch.max((self.goalX[0] - 0.5*self.L) - state_coords_unnormalized[..., 0:1], state_coords_unnormalized[..., 1:2])
-            dist_R2 = torch.max(state_coords_unnormalized[..., 5:6] - (self.goalX[1] + 0.5*self.L), -state_coords_unnormalized[..., 6:7])
-            return torch.max(dist_R1, dist_R2)
-
-        else:
-            raise NotImplementedError
-
-    def compute_gx(self, state_coords_unnormalized):
-        # Compute the obstacle boundary condition given the unnormalized state coordinates. Negative inside the obstacle positive outside.
-        # Distance from the lower curb
-        dist_lc_R1 = state_coords_unnormalized[:, 1:2] - self.curb_positions[0] - 0.5*self.L
-        dist_lc_R2 = state_coords_unnormalized[:, 6:7] - self.curb_positions[0] - 0.5*self.L
-        dist_lc = torch.min(dist_lc_R1, dist_lc_R2)
-        # dist_lc = torch.min(state_coords_unnormalized[:, 1:2] - self.curb_positions[0] - 0.5*self.L, state_coords_unnormalized[:, 6:7] - self.curb_positions[0] - 0.5*self.L)
-        
-        # Distance from the upper curb
-        dist_uc_R1 = self.curb_positions[1] - state_coords_unnormalized[:, 1:2] - 0.5*self.L
-        dist_uc_R2 = self.curb_positions[1] - state_coords_unnormalized[:, 6:7] - 0.5*self.L
-        dist_uc = torch.min(dist_uc_R1, dist_uc_R2)
-        # dist_uc = torch.min(self.curb_positions[1] - state_coords_unnormalized[:, 1:2] - 0.5*self.L, self.curb_positions[1] - state_coords_unnormalized[:, 6:7] - 0.5*self.L)
-        
-        # Distance from the stranded car
-        stranded_car_pos = torch.tensor(self.stranded_car_pos*1.0).type(torch.FloatTensor)
-
-        #dist_stranded_R1 = torch.norm(state_coords_unnormalized[:, 0:2] - stranded_car_pos, dim=1, keepdim=True) - self.L
-        #dist_stranded_R2 = torch.norm(state_coords_unnormalized[:, 5:7] - stranded_car_pos, dim=1, keepdim=True) - self.L
-        mu = state_coords_unnormalized[:, 10]
-        le = 2 + mu               #radius*
-        wi = 0.75 + 0.25 * mu     #radius*
-        le_inflated = le + 0.5*self.L
-        wi_inflated = wi + 0.5*self.L
-
-        state_centered_R1 = state_coords_unnormalized[:, 0:2] - stranded_car_pos
-        state_centered_R2 = state_coords_unnormalized[:, 5:7] - stranded_car_pos
-
-        scale = le_inflated/wi_inflated
-        dont_scale=torch.ones_like(scale)
-        scaling_mat=torch.t(torch.stack([dont_scale,scale],dim=0))
-
-        state_centered_R1=state_centered_R1*scaling_mat
-        state_centered_R2=state_centered_R1*scaling_mat        
-
-        le_inflated=torch.unsqueeze(le_inflated,0)   #le as column to be added with norm
-        le_inflated=torch.t(le_inflated)  
-        dist_stranded_R1 = torch.norm(state_centered_R1, dim=1, keepdim=True) - le_inflated
-        dist_stranded_R2 = torch.norm(state_centered_R2, dim=1, keepdim=True) - le_inflated
-
-        dist_stranded = torch.min(dist_stranded_R1, dist_stranded_R2)
-
-
-        # Distance between the vehicles themselves
-        dist_R1R2 = torch.norm(state_coords_unnormalized[:, 0:2] - state_coords_unnormalized[:, 5:7], dim=1, keepdim=True) - self.L
-
-        if self.collision_setting == 'v1':
-            return torch.min(torch.min(torch.min(dist_lc, dist_uc), dist_stranded), dist_R1R2) * self.gx_factor
-        elif self.collision_setting == 'v2':
-            return torch.min(torch.min(dist_lc, dist_uc), dist_stranded_R1) * self.gx_factor
-        elif self.collision_setting == 'v3':
-            return torch.min(dist_stranded, dist_R1R2) * self.gx_factor
-        elif self.collision_setting == 'v4':
-            return torch.min(torch.min(torch.min(dist_lc_R1, dist_uc_R1), dist_stranded_R1), dist_R1R2) * self.gx_factor
-        else:
-            raise NotImplementedError
-
-    def compute_IC(self, state_coords):
-        # Compute the boundary condition given the normalized state coordinates.
-        state_coords_unnormalized = state_coords * 1.0
-        state_coords_unnormalized[:, 0] = state_coords_unnormalized[:, 0] * self.alpha['x'] + self.beta['x']
-        state_coords_unnormalized[:, 1] = state_coords_unnormalized[:, 1] * self.alpha['y'] + self.beta['y']
-        state_coords_unnormalized[:, 2] = state_coords_unnormalized[:, 2] * self.alpha['th'] + self.beta['th']
-        state_coords_unnormalized[:, 3] = state_coords_unnormalized[:, 3] * self.alpha['v'] + self.beta['v']
-        state_coords_unnormalized[:, 4] = state_coords_unnormalized[:, 4] * self.alpha['phi'] + self.beta['phi']
-
-        state_coords_unnormalized[:, 5] = state_coords_unnormalized[:, 5] * self.alpha['x'] + self.beta['x']
-        state_coords_unnormalized[:, 6] = state_coords_unnormalized[:, 6] * self.alpha['y'] + self.beta['y']
-        state_coords_unnormalized[:, 7] = state_coords_unnormalized[:, 7] * self.alpha['th'] + self.beta['th']
-        state_coords_unnormalized[:, 8] = state_coords_unnormalized[:, 8] * self.alpha['v'] + self.beta['v']
-        state_coords_unnormalized[:, 9] = state_coords_unnormalized[:, 9] * self.alpha['phi'] + self.beta['phi']
-
-        state_coords_unnormalized[..., 10] = state_coords_unnormalized[..., 10] *1.0
-
-        lx = self.compute_lx(state_coords_unnormalized)
-        gx = self.compute_gx(state_coords_unnormalized)
-        hx = -gx
-        vx = torch.max(lx, hx)
-        # return lx, gx, vx
-        return lx, hx, vx
-
-    def compute_vehicle_ham(self, x, dudx, return_opt_ctrl=False, Rindex=None):
-        # Limit acceleration bounds based on the speed
-        zero_tensor = torch.Tensor([0]).cuda()
-        aMin = torch.ones_like(x[..., 3]) * self.aMin
-        aMin = torch.where((x[..., 3] <= self.vMin), zero_tensor, aMin)
-        aMax = torch.ones_like(x[..., 3]) * self.aMax
-        aMax = torch.where((x[..., 3] >= self.vMax), zero_tensor, aMax)
-
-        # Limit steering bounds based on the speed
-        psiMin = torch.ones_like(x[..., 4]) * self.psiMin
-        psiMin = torch.where((x[..., 4] <= self.phiMin), zero_tensor, psiMin)
-        psiMax = torch.ones_like(x[..., 4]) * self.psiMax
-        psiMax = torch.where((x[..., 4] >= self.phiMax), zero_tensor, psiMax)
-
-        # Compute optimal control
-        opt_acc = torch.where((dudx[..., 3] > 0), aMin, aMax)
-        opt_psi = torch.where((dudx[..., 4] > 0), psiMin, psiMax)
-
-        if (self.curriculum_version in ['v2', 'v3']) and (Rindex == 1):
-            # Velocity can't change
-            opt_acc = 0.0*opt_acc
-
-        # Compute Hamiltonian
-        ham_vehicle = x[..., 3] * torch.cos(x[..., 2]) * dudx[..., 0] + \
-                      x[..., 3] * torch.sin(x[..., 2]) * dudx[..., 1] + \
-                      x[..., 3] * torch.tan(x[..., 4]) * dudx[..., 2] / self.L + \
-                      opt_acc * dudx[..., 3] + \
-                      opt_psi * dudx[..., 4]
-
-        # Freeze the Hamiltonian if required
-        if self.ham_version == 'v2':
-            # Check if vehicle is within the target point and if so, freeze the Hamiltonian selectively
-            goal_tensor = torch.tensor([self.goalX[Rindex], self.goalY[Rindex]]).type(torch.FloatTensor)[None, None].cuda()
-            dist_to_goal = torch.norm(x[..., 0:2] - goal_tensor, dim=-1) - 0.5*self.L
-            ham_vehicle = torch.where((dist_to_goal <= 0), zero_tensor, ham_vehicle)
-        
-        if return_opt_ctrl:
-            opt_ctrl = torch.cat((opt_acc, opt_psi), dim=1)
-            return ham_vehicle, opt_ctrl
-        else:
-            return ham_vehicle
-
-    def compute_overall_ham(self, x, dudx, return_components=False):
-        alpha = self.alpha
-        beta = self.beta
-
-        # Scale the costates appropriately.
-        dudx[..., 0] = dudx[..., 0] / alpha['x']
-        dudx[..., 1] = dudx[..., 1] / alpha['y']
-        dudx[..., 2] = dudx[..., 2] / alpha['th']
-        dudx[..., 3] = dudx[..., 3] / alpha['v']
-        dudx[..., 4] = dudx[..., 4] / alpha['phi']
-
-        dudx[..., 5] = dudx[..., 5] / alpha['x']
-        dudx[..., 6] = dudx[..., 6] / alpha['y']
-        dudx[..., 7] = dudx[..., 7] / alpha['th']
-        dudx[..., 8] = dudx[..., 8] / alpha['v']
-        dudx[..., 9] = dudx[..., 9] / alpha['phi']
-
-        dudx[..., 10] = dudx[..., 10] * 1.0
-
-        # Scale for output normalization
-        norm_to = 0.02
-        mean = 0.25 * alpha['x']
-        var = 0.5 * alpha['x']
-        dudx = dudx * var/norm_to
-
-        # Scale the states appropriately.
-        x_unnormalized = x * 1.0
-        x_unnormalized[..., 0] = x_unnormalized[..., 0] * alpha['x'] + beta['x']
-        x_unnormalized[..., 1] = x_unnormalized[..., 1] * alpha['y'] + beta['y']
-        x_unnormalized[..., 2] = x_unnormalized[..., 2] * alpha['th'] + beta['th']
-        x_unnormalized[..., 3] = x_unnormalized[..., 3] * alpha['v'] + beta['v']
-        x_unnormalized[..., 4] = x_unnormalized[..., 4] * alpha['phi'] + beta['phi']
-
-        x_unnormalized[..., 5] = x_unnormalized[..., 5] * alpha['x'] + beta['x']
-        x_unnormalized[..., 6] = x_unnormalized[..., 6] * alpha['y'] + beta['y']
-        x_unnormalized[..., 7] = x_unnormalized[..., 7] * alpha['th'] + beta['th']
-        x_unnormalized[..., 8] = x_unnormalized[..., 8] * alpha['v'] + beta['v']
-        x_unnormalized[..., 9] = x_unnormalized[..., 9] * alpha['phi'] + beta['phi']
-
-        x_unnormalized[..., 10] = x_unnormalized[..., 10] * 1.0
-
-        # Compute the hamiltonian
-        ham_R1 = self.compute_vehicle_ham(x_unnormalized[..., 0:5], dudx[..., 0:5], Rindex=0) 
-
-        if self.curriculum_version == 'v4':
-            ham_R2 = 0.0
-        else:
-            ham_R2 = self.compute_vehicle_ham(x_unnormalized[..., 5:], dudx[..., 5:], Rindex=1)
-
-        ## Total Hamiltonian (take care of normalization again)
-        ham_R1 = ham_R1 / (var/norm_to)
-        ham_R2 = ham_R2 / (var/norm_to)
-        ham_total = ham_R1 + ham_R2
-
-        if return_components:
-            return ham_total, ham_R1, ham_R2
-        else:
-            return ham_total
-
-    def propagate_state(self, x, u, dt):
-        alpha = self.alpha
-        beta = self.beta
-
-        x_next = torch.zeros_like(x)
-        x_next[0] = x[3] * torch.cos(x[2])
-        x_next[1] = x[3] * torch.sin(x[2])
-        x_next[2] = x[3] * torch.tan(x[4]) / self.L
-        x_next[3] = u[0]
-        x_next[4] = u[1]
-
-        x_next[5] = x[8] * torch.cos(x[7])
-        x_next[6] = x[8] * torch.sin(x[7])
-        x_next[7] = x[8] * torch.tan(x[9]) / self.L
-        x_next[8] = u[2]
-        x_next[9] = u[3]
-
-        x_next[10] = 0
-
-        return x + dt*x_next          
-
-    def __len__(self):
-        return 1
-
-    def __getitem__(self, idx):
-        start_time = 0.  # time to apply  initial conditions
-
-        # uniformly sample domain and include coordinates where source is non-zero 
-        coords = torch.zeros(self.numpoints, self.num_states).uniform_(-1, 1)
-
-        if self.sampling_bias_ratio > 0.0:
-            valid_upper_boundary =  (self.curb_positions[1] - 0.5*self.L - self.beta['y'])/self.alpha['y']
-            num_samples = int(self.numpoints * self.sampling_bias_ratio)
-            coords[-num_samples:, 1] = coords[-num_samples:, 1] * valid_upper_boundary
-            coords[-num_samples:, 6] = coords[-num_samples:, 6] * valid_upper_boundary
-
-        if self.curriculum_version in ['v2', 'v4']:
-            # Set velocity to zero, only sample x and y around the goal state
-            speed_value = -self.beta['v']/self.alpha['v']
-            x_value_upper = (self.goalX[1] + 1.0 - self.beta['x'])/self.alpha['x']
-            x_value_lower = (self.goalX[1] - 1.0 - self.beta['x'])/self.alpha['x']
-            y_value_upper = (self.goalY[1] + 0.2 - self.beta['y'])/self.alpha['y']
-            y_value_lower = (self.goalY[1] - 0.2 - self.beta['y'])/self.alpha['y']
-            coords[:, 5] = torch.zeros(self.numpoints).uniform_(x_value_lower, x_value_upper)
-            coords[:, 6] = torch.zeros(self.numpoints).uniform_(y_value_lower, y_value_upper)
-            coords[:, 8] = torch.ones(self.numpoints) * speed_value
-        elif self.curriculum_version == 'v3':
-            # Set velocity to zero, sample x and y anywhere
-            speed_value = -self.beta['v']/self.alpha['v']
-            coords[:, 8] = torch.ones(self.numpoints) * speed_value
-
-        if self.pretrain:
-            # only sample in time around the initial condition
-            time = torch.ones(self.numpoints, 1) * start_time
-            coords = torch.cat((time, coords), dim=1)
-        else:
-            # slowly grow time values from start time; this currently assumes t \in [tMin, tMax]
-            time = self.tMin + torch.zeros(self.numpoints, 1).uniform_(0, (self.tMax-self.tMin) * (self.counter / self.full_count))
-            coords = torch.cat((time, coords), dim=1)
-
-            # make sure we always have training samples at the initial time
-            coords[-self.N_src_samples:, 0] = start_time
-
-        # Compute the initial value function
-        # lx, gx, boundary_values = self.compute_IC(coords[:, 1:])
-        lx, hx, boundary_values = self.compute_IC(coords[:, 1:])
-
-        # print('Min and max value before normalization are %0.4f and %0.4f' %(min(boundary_values), max(boundary_values)))
-        # print('Min and max l(x) before normalization are %0.4f and %0.4f' %(min(lx), max(lx)))
-        # print('Min and max g(x) before normalization are %0.4f and %0.4f' %(min(gx), max(gx)))
-        # print('Min and max h(x) before normalization are %0.4f and %0.4f' %(min(hx), max(hx)))
-        boundary_values = (boundary_values - self.mean)*self.norm_to/self.var
-        lx = (lx - self.mean)*self.norm_to/self.var
-        # gx = (gx - mean)*norm_to/var
-        hx = (hx - self.mean)*self.norm_to/self.var
-        # print('Min and max value after normalization are %0.4f and %0.4f' %(min(boundary_values), max(boundary_values)))
-        # print('Min and max l(x) after normalization are %0.4f and %0.4f' %(min(lx), max(lx)))
-        # print('Min and max g(x) after normalization are %0.4f and %0.4f' %(min(gx), max(gx)))
-        # print('Min and max h(x) after normalization are %0.4f and %0.4f' %(min(hx), max(hx)))
-
-        if self.pretrain:
-            dirichlet_mask = torch.ones(coords.shape[0], 1) > 0
-        else:
-            # only enforce initial conditions around start_time
-            dirichlet_mask = (coords[:, 0, None] == start_time)
-
-        if self.pretrain:
-            self.pretrain_counter += 1
-        elif self.counter < self.full_count:
-            self.counter += 1
-
-        if self.pretrain and self.pretrain_counter == self.pretrain_iters:
-            self.pretrain = False
-
-        # return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask, 'lx': lx, 'gx': gx}
-        return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask, 'lx': lx, 'hx': hx}
-
-class ReachabilityNarrowMuBugSource(Dataset): 
-    def __init__(self, numpoints, pretrain=False, tMin=0.0, tMax=0.5, counter_start=0, counter_end=100e3, pretrain_iters=2000, norm_scheme='hack1', clip_value_gradients=False,
-                 gx_factor=1.0, speed_setting='low', sampling_bias_ratio=0.0, env_setting='v1', ham_version='v1', target_setting='v1', collision_setting='v1', 
-                 curriculum_version='v1', HJIVI_smoothing_setting='v1', smoothing_exponent=2.0, num_src_samples=1000, diffModel=False):
-        super().__init__()
-        torch.manual_seed(0)
-
-        self.pretrain = pretrain
-        self.numpoints = numpoints
-        self.diffModel = diffModel
-        
-        self.num_vehicles = 2
-        self.num_states = 5 * self.num_vehicles + 1  #+mu
-
-        self.tMax = tMax
-        self.tMin = tMin
-
-        # Define state alphas and betas so that all coordinates are from [-1, 1]. 
-        # The conversion rule is state' = (state - beta)/alpha. state' is in [-1, 1].
-        # [state sequence: x_Ri, y_Ri, th_Ri, v_Ri, phi_Ri, ...]. Ri is the ith vehicle.
-        self.alpha = {}
-        self.beta = {}
-
-        # if speed_setting == 'high':
-        #     self.alpha['x'] = 60.0
-        #     self.alpha['y'] = 3.8
-        #     self.alpha['th'] = 1.2*math.pi
-        #     self.alpha['v'] = 7.0
-        #     self.alpha['phi'] = 1.2*0.1*math.pi
-        #     self.alpha['time'] = 10.0/self.tMax
-
-        #     self.beta['x'] = 0.0
-        #     self.beta['y'] = 0.0
-        #     self.beta['th'] = 0.0
-        #     self.beta['v'] = 6.0
-        #     self.beta['phi'] = 0.0
-
-        #     # Target positions
-        #     self.goalX = np.array([36.0, -36.0])
-        #     self.goalY = np.array([-1.4, 1.4])
-
-        #     # State bounds
-        #     self.vMin = 0.001
-        #     self.vMax = 11.999
-        #     self.phiMin = -0.1*math.pi + 0.001
-        #     self.phiMax = 0.1*math.pi - 0.001
-
-        #     # Control bounds
-        #     self.aMin = -4.0
-        #     self.aMax = 2.0
-        #     self.psiMin = -0.1*math.pi
-        #     self.psiMax = 0.1*math.pi
-        # elif speed_setting == 'low':
-        #     self.alpha['x'] = 8.0
-        #     self.alpha['y'] = 3.8
-        #     self.alpha['th'] = 1.2*math.pi
-        #     self.alpha['v'] = 3.0
-        #     self.alpha['phi'] = 1.2*0.1*math.pi
-        #     self.alpha['time'] = 6.0/self.tMax
-
-        #     self.beta['x'] = 0.0
-        #     self.beta['y'] = 0.0
-        #     self.beta['th'] = 0.0
-        #     self.beta['v'] = 2.0
-        #     self.beta['phi'] = 0.0
-
-        #     # Target positions
-        #     self.goalX = np.array([6.0, -6.0])
-        #     self.goalY = np.array([-1.4, 1.4])
-
-        #     # State bounds
-        #     self.vMin = 0.001
-        #     self.vMax = 4.50
-        #     self.phiMin = -0.1*math.pi + 0.001
-        #     self.phiMax = 0.1*math.pi - 0.001
-
-        #     # Control bounds
-        #     self.aMin = -4.0
-        #     self.aMax = 2.0
-        #     self.psiMin = -0.1*math.pi
-        #     self.psiMax = 0.1*math.pi
-        # elif speed_setting == 'medium':
-        #     self.alpha['x'] = 8.0
-        #     self.alpha['y'] = 3.8
-        #     self.alpha['th'] = 1.2*math.pi
-        #     self.alpha['v'] = 4.0
-        #     self.alpha['phi'] = 1.2*0.3*math.pi
-        #     self.alpha['time'] = 10.0/self.tMax
-
-        #     self.beta['x'] = 0.0
-        #     self.beta['y'] = 0.0
-        #     self.beta['th'] = 0.0
-        #     self.beta['v'] = 3.0
-        #     self.beta['phi'] = 0.0
-
-        #     # Target positions
-        #     self.goalX = np.array([6.0, -6.0])
-        #     self.goalY = np.array([-1.4, 1.4])
-
-        #     # State bounds
-        #     self.vMin = 0.001
-        #     self.vMax = 6.50
-        #     self.phiMin = -0.3*math.pi + 0.001
-        #     self.phiMax = 0.3*math.pi - 0.001
-
-        #     # Control bounds
-        #     self.aMin = -4.0
-        #     self.aMax = 2.0
-        #     self.psiMin = -0.3*math.pi
-        #     self.psiMax = 0.3*math.pi
-        if speed_setting == 'medium_v2':
-            self.alpha['x'] = 8.0
-            self.alpha['y'] = 3.8
-            self.alpha['th'] = 1.2*math.pi
-            self.alpha['v'] = 4.0
-            self.alpha['phi'] = 1.2*0.3*math.pi
-            self.alpha['time'] = 1.0
-
-            self.beta['x'] = 0.0
-            self.beta['y'] = 0.0
-            self.beta['th'] = 0.0
-            self.beta['v'] = 3.0
-            self.beta['phi'] = 0.0
-
-            # Target positions
-            self.goalX = np.array([6.0, -6.0])
-            self.goalY = np.array([-1.4, 1.4])
-
-            # State bounds
-            self.vMin = 0.001
-            self.vMax = 6.50
-            self.phiMin = -0.3*math.pi + 0.001 #0.95
-            self.phiMax = 0.3*math.pi - 0.001
-
-            # Control bounds
-            self.aMin = -4.0
-            self.aMax = 2.0
-            self.psiMin = -3.0*math.pi
-            self.psiMax = 3.0*math.pi
-        # elif speed_setting == 'medium_v3':
-        #     self.alpha['x'] = 8.0
-        #     self.alpha['y'] = 4.0
-        #     self.alpha['th'] = 1.2*math.pi
-        #     self.alpha['v'] = 4.0
-        #     self.alpha['phi'] = 1.2*0.3*math.pi
-        #     self.alpha['time'] = 10.0/self.tMax
-
-        #     self.beta['x'] = 0.0
-        #     self.beta['y'] = 0.0
-        #     self.beta['th'] = 0.0
-        #     self.beta['v'] = 3.0
-        #     self.beta['phi'] = 0.0
-
-        #     # Target positions
-        #     self.goalX = np.array([6.0, -6.0])
-        #     self.goalY = np.array([-2.0, 2.0])
-
-        #     # State bounds
-        #     self.vMin = 0.001
-        #     self.vMax = 6.50
-        #     self.phiMin = -0.3*math.pi + 0.001
-        #     self.phiMax = 0.3*math.pi - 0.001
-
-        #     # Control bounds
-        #     self.aMin = -4.0
-        #     self.aMax = 2.0
-        #     self.psiMin = -3.0*math.pi
-        #     self.psiMax = 3.0*math.pi
-        else:
-            raise NotImplementedError
-
-        # How to weigh the obstacles
-        self.gx_factor = gx_factor
-
-        # if env_setting == 'v1':
-        #     # Vehicle diameter/length
-        #     self.L = 2.0
-        #     self.le = 3.0
-        #     self.wi = 1.0
-
-        #     # Lower and upper curb positions (in the y direction)
-        #     self.curb_positions = np.array([-2.8, 2.8])
-
-        #     # Stranded car position
-        #     self.stranded_car_pos = np.array([0.0, -1.4])
-        if env_setting == 'v2':
-            # Vehicle diameter/length
-            self.L = 2.0
+        if self.diffModel:
+            coords_var = torch.tensor(coords.clone(), requires_grad=True)
+            boundary_values = self.compute_lx(coords_var[..., 1:])
             
-            # Lower and upper curb positions (in the y direction)
-            self.curb_positions = np.array([-2.8, 2.8])
+            # Normalize the value function
+            # print('Min and max value before normalization are %0.4f and %0.4f' %(min(boundary_values), max(boundary_values)))
+            boundary_values = (boundary_values - self.mean)*self.norm_to/self.var
 
-            # Stranded car position
-            self.stranded_car_pos = np.array([0.0, -1.8])
-        # elif env_setting == 'v3':
-        #     # Vehicle diameter/length
-        #     self.L = 2.0
-
-        #     # Lower and upper curb positions (in the y direction)
-        #     self.curb_positions = np.array([-4.0, 4.0])
-
-        #     # Stranded car position
-        #     self.stranded_car_pos = np.array([0.0, -2.0])
+            # Compute the gradients of the value function wrt state
+            lx_grads = diff_operators.gradient(boundary_values, coords_var)[..., 1:]
         else:
-            raise NotImplementedError
+            boundary_values = self.compute_lx(coords[..., 1:])
 
-        self.N_src_samples = num_src_samples
+            # Normalize the value function
+            # print('Min and max value before normalization are %0.4f and %0.4f' %(min(boundary_values), max(boundary_values)))
+            boundary_values = (boundary_values - self.mean)*self.norm_to/self.var
 
-        self.pretrain_counter = 0
-        self.counter = counter_start
-        self.pretrain_iters = pretrain_iters
-        self.full_count = counter_end 
-
-        self.normalization_scheme = norm_scheme
-        self.sampling_bias_ratio = sampling_bias_ratio
-        self.clip_value_gradients = clip_value_gradients
-
-        self.ham_version = ham_version
-        self.target_setting = target_setting
-        self.collision_setting = collision_setting
-        self.curriculum_version = curriculum_version
-        self.HJIVI_smoothing_setting = HJIVI_smoothing_setting
-        self.smoothing_exponent = smoothing_exponent
-
-        if self.normalization_scheme == 'hack1':
-            self.norm_to = 0.02
-            self.mean = 0.25 * self.alpha['x']
-            self.var = 0.5 * self.alpha['x']
-        else:
-            raise NotImplementedError
-
-    def compute_lx(self, state_coords_unnormalized):
-        # Compute the target boundary condition given the unnormalized state coordinates.
-        if self.target_setting in ['v1', 'v2', 'v4']:
-            # Vehicle 1
-            goal_tensor_R1 = torch.tensor([self.goalX[0], self.goalY[0]]).type(torch.FloatTensor)[None]
-            dist_R1 = torch.norm(state_coords_unnormalized[:, 0:2] - goal_tensor_R1, dim=1, keepdim=True) - self.L
-            # Vehicle 2
-            goal_tensor_R2 = torch.tensor([self.goalX[1], self.goalY[1]]).type(torch.FloatTensor)[None]
-            dist_R2 = torch.norm(state_coords_unnormalized[:, 5:7] - goal_tensor_R2, dim=1, keepdim=True) - self.L
-            if self.target_setting == 'v1':
-                return torch.max(dist_R1, dist_R2)
-            elif self.target_setting == 'v2':
-                return dist_R1
-            elif self.target_setting == 'v4':
-                sum_tensor = 0.5*(dist_R1 + dist_R2)
-                max_tensor = 0.5*torch.max(dist_R1, dist_R2)
-                sign_tensor = torch.sign(dist_R1 * dist_R2)
-                return torch.where(sign_tensor < 0, max_tensor, sum_tensor)
-        
-        elif self.target_setting in ['v3']:
-            # Have an infinitely extended target set above and below the center lane
-            dist_R1 = torch.max((self.goalX[0] - 0.5*self.L) - state_coords_unnormalized[..., 0:1], state_coords_unnormalized[..., 1:2])
-            dist_R2 = torch.max(state_coords_unnormalized[..., 5:6] - (self.goalX[1] + 0.5*self.L), -state_coords_unnormalized[..., 6:7])
-            return torch.max(dist_R1, dist_R2)
-
-        else:
-            raise NotImplementedError
-
-    def compute_gx(self, state_coords_unnormalized):
-        # Compute the obstacle boundary condition given the unnormalized state coordinates. Negative inside the obstacle positive outside.
-        # Distance from the lower curb
-        dist_lc_R1 = state_coords_unnormalized[:, 1:2] - self.curb_positions[0] - 0.5*self.L
-        dist_lc_R2 = state_coords_unnormalized[:, 6:7] - self.curb_positions[0] - 0.5*self.L
-        dist_lc = torch.min(dist_lc_R1, dist_lc_R2)
-        # dist_lc = torch.min(state_coords_unnormalized[:, 1:2] - self.curb_positions[0] - 0.5*self.L, state_coords_unnormalized[:, 6:7] - self.curb_positions[0] - 0.5*self.L)
-        
-        # Distance from the upper curb
-        dist_uc_R1 = self.curb_positions[1] - state_coords_unnormalized[:, 1:2] - 0.5*self.L
-        dist_uc_R2 = self.curb_positions[1] - state_coords_unnormalized[:, 6:7] - 0.5*self.L
-        dist_uc = torch.min(dist_uc_R1, dist_uc_R2)
-        # dist_uc = torch.min(self.curb_positions[1] - state_coords_unnormalized[:, 1:2] - 0.5*self.L, self.curb_positions[1] - state_coords_unnormalized[:, 6:7] - 0.5*self.L)
-        
-        # Distance from the stranded car
-        stranded_car_pos = torch.tensor(self.stranded_car_pos*1.0).type(torch.FloatTensor)
-        # dist_stranded_R1 = torch.norm(state_coords_unnormalized[:, 0:2] - stranded_car_pos, dim=1, keepdim=True) - self.L
-        # dist_stranded_R2 = torch.norm(state_coords_unnormalized[:, 5:7] - stranded_car_pos, dim=1, keepdim=True) - self.L
-        mu = state_coords_unnormalized[:, 10]
-        le = 2 + mu               #radius*
-        wi = 0.75 + 0.25 * mu     #radius*
-        le_inflated = le + 0.5*self.L
-        wi_inflated = wi + 0.5*self.L
-
-        state_centered_R1 = state_coords_unnormalized[:, 0:2] - stranded_car_pos
-        state_centered_R2 = state_coords_unnormalized[:, 5:7] - stranded_car_pos
-
-        scale = le_inflated/wi_inflated
-        dont_scale=torch.ones_like(scale)
-        scaling_mat=torch.t(torch.stack([dont_scale,scale],dim=0))
-
-        state_centered_R1=state_centered_R1*scaling_mat
-        state_centered_R2=state_centered_R1*scaling_mat        
-
-        le_inflated=torch.unsqueeze(le_inflated,0)   #le as column to be added with norm
-        le_inflated=torch.t(le_inflated)  
-        dist_stranded_R1 = torch.norm(state_centered_R1, dim=1, keepdim=True) - le_inflated
-        dist_stranded_R2 = torch.norm(state_centered_R2, dim=1, keepdim=True) - le_inflated
-
-        dist_stranded = torch.min(dist_stranded_R1, dist_stranded_R2)
-        
-        # Distance between the vehicles themselves
-        dist_R1R2 = torch.norm(state_coords_unnormalized[:, 0:2] - state_coords_unnormalized[:, 5:7], dim=1, keepdim=True) - self.L
-
-        if self.collision_setting == 'v1':
-            return torch.min(torch.min(torch.min(dist_lc, dist_uc), dist_stranded), dist_R1R2) * self.gx_factor
-        elif self.collision_setting == 'v2':
-            return torch.min(torch.min(dist_lc, dist_uc), dist_stranded_R1) * self.gx_factor
-        elif self.collision_setting == 'v3':
-            return torch.min(dist_stranded, dist_R1R2) * self.gx_factor
-        elif self.collision_setting == 'v4':
-            return torch.min(torch.min(torch.min(dist_lc_R1, dist_uc_R1), dist_stranded_R1), dist_R1R2) * self.gx_factor
-        else:
-            raise NotImplementedError
-
-    def compute_IC(self, state_coords):
-        # Compute the boundary condition given the normalized state coordinates.
-        state_coords_unnormalized = state_coords * 1.0
-        state_coords_unnormalized[:, 0] = state_coords_unnormalized[:, 0] * self.alpha['x'] + self.beta['x']
-        state_coords_unnormalized[:, 1] = state_coords_unnormalized[:, 1] * self.alpha['y'] + self.beta['y']
-        state_coords_unnormalized[:, 2] = state_coords_unnormalized[:, 2] * self.alpha['th'] + self.beta['th']
-        state_coords_unnormalized[:, 3] = state_coords_unnormalized[:, 3] * self.alpha['v'] + self.beta['v']
-        state_coords_unnormalized[:, 4] = state_coords_unnormalized[:, 4] * self.alpha['phi'] + self.beta['phi']
-
-        state_coords_unnormalized[:, 5] = state_coords_unnormalized[:, 5] * self.alpha['x'] + self.beta['x']
-        state_coords_unnormalized[:, 6] = state_coords_unnormalized[:, 6] * self.alpha['y'] + self.beta['y']
-        state_coords_unnormalized[:, 7] = state_coords_unnormalized[:, 7] * self.alpha['th'] + self.beta['th']
-        state_coords_unnormalized[:, 8] = state_coords_unnormalized[:, 8] * self.alpha['v'] + self.beta['v']
-        state_coords_unnormalized[:, 9] = state_coords_unnormalized[:, 9] * self.alpha['phi'] + self.beta['phi']
-
-        state_coords_unnormalized[..., 10] = state_coords_unnormalized[..., 10] *1.0
-
-        lx = self.compute_lx(state_coords_unnormalized)
-        gx = self.compute_gx(state_coords_unnormalized)
-        hx = gx * (-1)
-
-        # combined = torch.cat((lx.unsqueeze(1), hx.unsqueeze(1)), dim=1)
-        # vx=torch.max(combined, dim=1)[0]
-        vx = torch.max(lx, hx)
-        # return lx, gx, vx
-        return lx, gx, vx
-
-    def compute_vehicle_ham(self, x, dudx, return_opt_ctrl=False, Rindex=None):
-        # Limit acceleration bounds based on the speed
-        zero_tensor = torch.Tensor([0]).cuda()
-        aMin = torch.ones_like(x[..., 3]) * self.aMin
-        aMin = torch.where((x[..., 3] <= self.vMin), zero_tensor, aMin)
-        aMax = torch.ones_like(x[..., 3]) * self.aMax
-        aMax = torch.where((x[..., 3] >= self.vMax), zero_tensor, aMax)
-
-        # Limit steering bounds based on the speed
-        psiMin = torch.ones_like(x[..., 4]) * self.psiMin
-        psiMin = torch.where((x[..., 4] <= self.phiMin), zero_tensor, psiMin)
-        psiMax = torch.ones_like(x[..., 4]) * self.psiMax
-        psiMax = torch.where((x[..., 4] >= self.phiMax), zero_tensor, psiMax)
-
-        # Compute optimal control
-        opt_acc = torch.where((dudx[..., 3] > 0), aMin, aMax)
-        opt_psi = torch.where((dudx[..., 4] > 0), psiMin, psiMax)
-
-        if (self.curriculum_version in ['v2', 'v3']) and (Rindex == 1):
-            # Velocity can't change
-            opt_acc = 0.0*opt_acc
-
-        # Compute Hamiltonian
-        ham_vehicle = x[..., 3] * torch.cos(x[..., 2]) * dudx[..., 0] + \
-                      x[..., 3] * torch.sin(x[..., 2]) * dudx[..., 1] + \
-                      x[..., 3] * torch.tan(x[..., 4]) * dudx[..., 2] / self.L + \
-                      opt_acc * dudx[..., 3] + \
-                      opt_psi * dudx[..., 4]
-
-        # Freeze the Hamiltonian if required
-        if self.ham_version == 'v2':
-            # Check if vehicle is within the target point and if so, freeze the Hamiltonian selectively
-            goal_tensor = torch.tensor([self.goalX[Rindex], self.goalY[Rindex]]).type(torch.FloatTensor)[None, None].cuda()
-            dist_to_goal = torch.norm(x[..., 0:2] - goal_tensor, dim=-1) - 0.5*self.L
-            ham_vehicle = torch.where((dist_to_goal <= 0), zero_tensor, ham_vehicle)
-        
-        if return_opt_ctrl:
-            opt_ctrl = torch.cat((opt_acc, opt_psi), dim=1)
-            return ham_vehicle, opt_ctrl
-        else:
-            return ham_vehicle
-
-    def compute_overall_ham(self, x, dudx, return_components=False):
-        alpha = self.alpha
-        beta = self.beta
-
-        # Scale the costates appropriately.
-        dudx[..., 0] = dudx[..., 0] / alpha['x']
-        dudx[..., 1] = dudx[..., 1] / alpha['y']
-        dudx[..., 2] = dudx[..., 2] / alpha['th']
-        dudx[..., 3] = dudx[..., 3] / alpha['v']
-        dudx[..., 4] = dudx[..., 4] / alpha['phi']
-
-        dudx[..., 5] = dudx[..., 5] / alpha['x']
-        dudx[..., 6] = dudx[..., 6] / alpha['y']
-        dudx[..., 7] = dudx[..., 7] / alpha['th']
-        dudx[..., 8] = dudx[..., 8] / alpha['v']
-        dudx[..., 9] = dudx[..., 9] / alpha['phi']
-
-        dudx[..., 10] = dudx[..., 10] * 1.0
-
-        # Scale for output normalization
-        norm_to = 0.02
-        mean = 0.25 * alpha['x']
-        var = 0.5 * alpha['x']
-        dudx = dudx * var/norm_to
-
-        # Scale the states appropriately.
-        x_unnormalized = x * 1.0
-        x_unnormalized[..., 0] = x_unnormalized[..., 0] * alpha['x'] + beta['x']
-        x_unnormalized[..., 1] = x_unnormalized[..., 1] * alpha['y'] + beta['y']
-        x_unnormalized[..., 2] = x_unnormalized[..., 2] * alpha['th'] + beta['th']
-        x_unnormalized[..., 3] = x_unnormalized[..., 3] * alpha['v'] + beta['v']
-        x_unnormalized[..., 4] = x_unnormalized[..., 4] * alpha['phi'] + beta['phi']
-
-        x_unnormalized[..., 5] = x_unnormalized[..., 5] * alpha['x'] + beta['x']
-        x_unnormalized[..., 6] = x_unnormalized[..., 6] * alpha['y'] + beta['y']
-        x_unnormalized[..., 7] = x_unnormalized[..., 7] * alpha['th'] + beta['th']
-        x_unnormalized[..., 8] = x_unnormalized[..., 8] * alpha['v'] + beta['v']
-        x_unnormalized[..., 9] = x_unnormalized[..., 9] * alpha['phi'] + beta['phi']
-        x_unnormalized[..., 10] = x_unnormalized[..., 10] * 1.0
-
-        # Compute the hamiltonian
-        ham_R1 = self.compute_vehicle_ham(x_unnormalized[..., 0:5], dudx[..., 0:5], Rindex=0) 
-
-        if self.curriculum_version == 'v4':
-            ham_R2 = 0.0
-        else:
-            ham_R2 = self.compute_vehicle_ham(x_unnormalized[..., 5:], dudx[..., 5:], Rindex=1)
-
-        ## Total Hamiltonian (take care of normalization again)
-        ham_R1 = ham_R1 / (var/norm_to)
-        ham_R2 = ham_R2 / (var/norm_to)
-        ham_total = ham_R1 + ham_R2
-
-        if return_components:
-            return ham_total, ham_R1, ham_R2
-        else:
-            return ham_total
-
-    def propagate_state(self, x, u, dt):
-        alpha = self.alpha
-        beta = self.beta
-
-        x_next = torch.zeros_like(x)
-        x_next[0] = x[3] * torch.cos(x[2])
-        x_next[1] = x[3] * torch.sin(x[2])
-        x_next[2] = x[3] * torch.tan(x[4]) / self.L
-        x_next[3] = u[0]
-        x_next[4] = u[1]
-
-        x_next[5] = x[8] * torch.cos(x[7])
-        x_next[6] = x[8] * torch.sin(x[7])
-        x_next[7] = x[8] * torch.tan(x[9]) / self.L
-        x_next[8] = u[2]
-        x_next[9] = u[3]
-
-        x_next[10] = 0 
-        return x + dt*x_next          
-
-    def __len__(self):
-        return 1
-
-    def __getitem__(self, idx):
-        start_time = 0.  # time to apply  initial conditions
-
-        # uniformly sample domain and include coordinates where source is non-zero 
-        coords = torch.zeros(self.numpoints, self.num_states).uniform_(-1, 1)
-
-        if self.sampling_bias_ratio > 0.0:
-            valid_upper_boundary =  (self.curb_positions[1] - 0.5*self.L - self.beta['y'])/self.alpha['y']
-            num_samples = int(self.numpoints * self.sampling_bias_ratio)
-            coords[-num_samples:, 1] = coords[-num_samples:, 1] * valid_upper_boundary
-            coords[-num_samples:, 6] = coords[-num_samples:, 6] * valid_upper_boundary
-
-        if self.curriculum_version in ['v2', 'v4']:
-            # Set velocity to zero, only sample x and y around the goal state
-            speed_value = -self.beta['v']/self.alpha['v']
-            x_value_upper = (self.goalX[1] + 1.0 - self.beta['x'])/self.alpha['x']
-            x_value_lower = (self.goalX[1] - 1.0 - self.beta['x'])/self.alpha['x']
-            y_value_upper = (self.goalY[1] + 0.2 - self.beta['y'])/self.alpha['y']
-            y_value_lower = (self.goalY[1] - 0.2 - self.beta['y'])/self.alpha['y']
-            coords[:, 5] = torch.zeros(self.numpoints).uniform_(x_value_lower, x_value_upper)
-            coords[:, 6] = torch.zeros(self.numpoints).uniform_(y_value_lower, y_value_upper)
-            coords[:, 8] = torch.ones(self.numpoints) * speed_value
-        elif self.curriculum_version == 'v3':
-            # Set velocity to zero, sample x and y anywhere
-            speed_value = -self.beta['v']/self.alpha['v']
-            coords[:, 8] = torch.ones(self.numpoints) * speed_value
-
-        if self.pretrain:
-            # only sample in time around the initial condition
-            time = torch.ones(self.numpoints, 1) * start_time
-            coords = torch.cat((time, coords), dim=1)
-        else:
-            # slowly grow time values from start time; this currently assumes t \in [tMin, tMax]
-            time = self.tMin + torch.zeros(self.numpoints, 1).uniform_(0, (self.tMax-self.tMin) * (self.counter / self.full_count))
-            coords = torch.cat((time, coords), dim=1)
-
-            # make sure we always have training samples at the initial time
-            coords[-self.N_src_samples:, 0] = start_time
-
-        # Compute the initial value function
-        if self.diffModel:
-            coords_var = coords.clone().detach().requires_grad_(True)
-            #coords_var = torch.tensor(coords.clone(), requires_grad=True)
-            lx, hx, boundary_values = self.compute_IC(coords_var[:, 1:])
-        else:
-            # lx, gx, boundary_values = self.compute_IC(coords[:, 1:])
-            lx, hx, boundary_values = self.compute_IC(coords[:, 1:])
-
-        # Normalize the value function
-        # print('Min and max value before normalization are %0.4f and %0.4f' %(min(boundary_values), max(boundary_values)))
-        # print('Min and max l(x) before normalization are %0.4f and %0.4f' %(min(lx), max(lx)))
-        # print('Min and max g(x) before normalization are %0.4f and %0.4f' %(min(gx), max(gx)))
-        # print('Min and max h(x) before normalization are %0.4f and %0.4f' %(min(hx), max(hx)))
-        boundary_values = (boundary_values - self.mean)*self.norm_to/self.var
-        lx = (lx - self.mean)*self.norm_to/self.var
-        # gx = (gx - self.mean)*self.norm_to/self.var
-        hx = (hx - self.mean)*self.norm_to/self.var
-        # print('Min and max value after normalization are %0.4f and %0.4f' %(min(boundary_values), max(boundary_values)))
-        # print('Min and max l(x) after normalization are %0.4f and %0.4f' %(min(lx), max(lx)))
-        # print('Min and max g(x) after normalization are %0.4f and %0.4f' %(min(gx), max(gx)))
-        # print('Min and max h(x) after normalization are %0.4f and %0.4f' %(min(hx), max(hx)))
-
-        # Compute the boundary value fuction gradient if required
-        if self.diffModel:
-            boundary_valfunc_grads = diff_operators.gradient(boundary_values, coords_var)[..., 1:]
-        #kek replaces undefined diff_operators
         if self.pretrain:
             dirichlet_mask = torch.ones(coords.shape[0], 1) > 0
         else:
@@ -3060,8 +818,6 @@ class ReachabilityNarrowMuBugSource(Dataset):
             self.pretrain = False
 
         if self.diffModel:
-            return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask, 'boundary_valfunc_grads': boundary_valfunc_grads, 'lx': lx, 'hx': hx}
+            return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask, 'lx_grads': lx_grads}
         else:
-            # return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask, 'lx': lx, 'gx': gx}
-            return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask, 'lx': lx, 'hx': hx}
-
+            return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask}
