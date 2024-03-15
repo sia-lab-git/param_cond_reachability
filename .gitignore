@@ -8,6 +8,8 @@ __pycache__/
 
 #kekes
 *.png
+!ego_aircraft.png
+!pursuer_aircraft.png
 *.pth
 *.txt
 *.0
