@@ -13,8 +13,8 @@ This is the official implementation of the paper "Parameter-Conditioned Reachabl
 ## Get started
 You can then set up a conda environment with all dependencies like so:
 ```
-conda env create -f environment.yml
-conda activate siren
+conda env create -f environment.yml   (replace torch version with the one compatible with your current CUDA ver.)
+conda activate param_cond_brt
 ```
 
 ## High-Level structure
